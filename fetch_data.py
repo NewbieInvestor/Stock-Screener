@@ -291,7 +291,16 @@ def fetch_stock_data(item, max_retries=4):
                 "Margen Operativo (%)": pct("operatingMargins"),
                 "Margen Neto (%)": pct("profitMargins"),
                 "Current Ratio": info.get("currentRatio"),
-                "Debt/Equity": info.get("debtToEquity"),
+                # Yahoo devuelve debtToEquity como porcentaje (48.85 =
+                # 48.85%); lo convertimos a ratio plano (0.4885) porque
+                # es el estándar que usa todo el mundo (Finviz incluido)
+                # y es lo que ya asumen nuestros propios filtros de
+                # "Debt/Equity < 1".
+                "Debt/Equity": (
+                    info.get("debtToEquity") / 100
+                    if info.get("debtToEquity") is not None
+                    else None
+                ),
                 "Payout Ratio (%)": pct("payoutRatio"),
                 "Crec. Ventas YoY (%)": pct("revenueGrowth"),
                 "Crec. Ventas 3Y (%)": pct("revenueGrowth"),
