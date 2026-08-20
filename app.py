@@ -420,8 +420,13 @@ def main():
 
     # COLUMNA 1: COMPANY, VALUATION, PROFITABILITY
     with col1:
+        # Obtener Market Cap con fallback por si viene vacío desde el CSV o yfinance
+        mcap_val = row.get("Market Cap (B)")
+        if (pd.isna(mcap_val) or mcap_val is None) and extra.get("shares_out") and row.get("Precio"):
+            mcap_val = (row.get("Precio") * extra.get("shares_out")) / 1e9
+
         render_block("COMPANY", [
-            ("Market Cap", fmt_val(row.get("Market Cap (B)"), is_money=True, multiplier=1e9)),
+            ("Market Cap", fmt_val(mcap_val, is_money=True, multiplier=1e9)),
             ("Price", f"{row.get('Precio', 0):.2f}"),
             ("Employees", fmt_val(extra.get("empleados"))),
             ("Country", extra.get("country", "-")),
