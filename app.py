@@ -88,6 +88,19 @@ RATIO_PRESETS = [
     ("Personalizado", "custom", "custom"),
 ]
 
+PB_PRESETS = [
+    ("Cualquiera", None, None),
+    ("Positivo (>0)", 0, None),
+    ("Bajo (<1)", None, 1),
+    ("Bajo (<2)", None, 2),
+    ("Bajo (<3)", None, 3),
+    ("Bajo (<5)", None, 5),
+    ("Bajo (<10)", None, 10),
+    ("Alto (>10)", 10, None),
+    ("Negativo (<0)", None, 0),
+    ("Personalizado", "custom", "custom"),
+]
+
 # Market Cap en miles de millones (B), igual que la columna del CSV.
 # Umbrales estilo Finviz: Mega >=200B, Large 10-200B, Mid 2-10B,
 # Small 0.3-2B, Micro 0.05-0.3B, Nano <0.05B (50M).
@@ -115,7 +128,7 @@ def finviz_filter(col, label, kind="growth", key_prefix=""):
     """Dropdown de presets estilo Finviz/ScreenerHero (Any, Over X%,
     Positive, Negative...) con opción de rango personalizado. Devuelve
     (min, max) o None si no se aplica filtro."""
-    presets = {"valuation": VALUATION_PRESETS, "growth": GROWTH_PRESETS, "ratio": RATIO_PRESETS, "mcap": MCAP_PRESETS}[kind]
+    presets = {"valuation": VALUATION_PRESETS, "growth": GROWTH_PRESETS, "ratio": RATIO_PRESETS, "mcap": MCAP_PRESETS, "pb": PB_PRESETS}[kind]
     labels = [p[0] for p in presets]
     key = f"{key_prefix}_{col}"
     choice = st.selectbox(label, labels, key=key)
@@ -127,17 +140,17 @@ def finviz_filter(col, label, kind="growth", key_prefix=""):
         max_v = c2.number_input("Max", value=None, key=f"{key}_max", format="%.2f", placeholder="Max")
         if min_v is None and max_v is None:
             return None
-        return (min_v, max_v)
+        return (min_v, max_v, label)
 
     if lo is None and hi is None:
         return None
-    return (lo, hi)
+    return (lo, hi, label)
 
 
 def apply_finviz_filter(df, col, sel, allow_na=True):
     if sel is None:
         return pd.Series(True, index=df.index)
-    lo, hi = sel
+    lo, hi, _label = sel
     serie = pd.to_numeric(df[col], errors="coerce")
     mask = pd.Series(True, index=df.index)
     if lo is not None:
@@ -191,7 +204,7 @@ def main():
             sels["PER (Forward)"] = finviz_filter("PER (Forward)", "PER (Forward)", "valuation", "val")
             sels["EV/Sales"] = finviz_filter("EV/Sales", "EV/Sales", "valuation", "val")
         with c3:
-            sels["P/B"] = finviz_filter("P/B", "P/B", "valuation", "val")
+            sels["P/B"] = finviz_filter("P/B", "P/B", "pb", "val")
             sels["PEG"] = finviz_filter("PEG", "PEG", "valuation", "val")
         with c4:
             sels["P/FCF"] = finviz_filter("P/FCF", "P/FCF", "valuation", "val")
@@ -234,6 +247,31 @@ def main():
         mask &= apply_finviz_filter(df_f, col, sel, allow_na=ignorar_na)
 
     resultado = df_f[mask].sort_values("PER (Trailing)")
+
+    # Resumen de filtros activos: qué está aplicado y con qué valor
+    # exacto (min/max), para no tener que ir pestaña por pestaña para
+    # recordar qué se ha seleccionado.
+    activos = []
+    if len(indices_sel) != len(indices_disponibles):
+        activos.append(f"**Índices:** {', '.join(indices_sel) if indices_sel else 'ninguno'}")
+    for col, sel in sels.items():
+        if sel is None:
+            continue
+        lo, hi, label = sel
+        if lo is not None and hi is not None:
+            rango = f"{lo:g} – {hi:g}"
+        elif lo is not None:
+            rango = f"≥ {lo:g}"
+        elif hi is not None:
+            rango = f"≤ {hi:g}"
+        else:
+            continue
+        activos.append(f"**{col}:** {label} ({rango})")
+
+    if activos:
+        st.caption("Filtros activos: " + "  ·  ".join(activos))
+    else:
+        st.caption("Sin filtros activos — mostrando todo el universo seleccionado.")
 
     st.subheader(f"Resultados: {len(resultado)} empresas")
     st.dataframe(resultado, use_container_width=True, height=350)
