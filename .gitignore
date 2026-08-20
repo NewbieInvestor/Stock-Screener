@@ -1,6 +1,8 @@
+market_data_meta.json
 fetch_failed.txt
 fetch_skipped_no_equity.txt
-screener_resultados.csv__pycache__/
+__pycache__/
 *.pyc
 .venv/
 venv/
+screener_resultados.csv
