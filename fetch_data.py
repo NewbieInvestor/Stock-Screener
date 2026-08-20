@@ -271,6 +271,30 @@ def fetch_stock_data(item, max_retries=4):
                 val = info.get(key)
                 return val * 100 if val is not None else None
 
+            def cagr_3y(row_name):
+                """CAGR real a 3 años a partir del income statement anual
+                (financials), comparando el valor más reciente con el de
+                hace 3 ejercicios. Devuelve % o None si no hay histórico
+                suficiente (salidas a bolsa recientes, datos incompletos
+                en Yahoo, etc.). Requiere una llamada de red extra por
+                ticker -> el fetch será más lento que antes."""
+                try:
+                    fin = stock.financials  # columnas = años, más reciente primero
+                    if fin is None or row_name not in fin.index:
+                        return None
+                    serie = fin.loc[row_name].dropna()
+                    if len(serie) < 4:
+                        return None
+                    valor_reciente, valor_hace_3y = serie.iloc[0], serie.iloc[3]
+                    if valor_hace_3y is None or valor_hace_3y <= 0 or valor_reciente is None:
+                        return None
+                    return ((valor_reciente / valor_hace_3y) ** (1 / 3) - 1) * 100
+                except Exception:
+                    return None
+
+            crec_ventas_3y = cagr_3y("Total Revenue")
+            crec_eps_3y = cagr_3y("Diluted EPS")
+
             return {
                 "Ticker": ticker,
                 "Nombre": info.get("shortName", ticker),
@@ -303,9 +327,9 @@ def fetch_stock_data(item, max_retries=4):
                 ),
                 "Payout Ratio (%)": pct("payoutRatio"),
                 "Crec. Ventas YoY (%)": pct("revenueGrowth"),
-                "Crec. Ventas 3Y (%)": pct("revenueGrowth"),
+                "Crec. Ventas 3Y (%)": crec_ventas_3y,
                 "Crec. EPS YoY (%)": pct("earningsGrowth"),
-                "Crec. EPS 3Y (%)": pct("earningsQuarterlyGrowth"),
+                "Crec. EPS 3Y (%)": crec_eps_3y,
                 "Market Cap (B)": (mcap / 1e9) if mcap else None,
             }
         except Exception as e:
