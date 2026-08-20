@@ -1,7 +1,0 @@
-market_data.csv
-market_data_meta.json
-fetch_failed.txt
-__pycache__/
-*.pyc
-.venv/
-venv/
