@@ -41,6 +41,7 @@ logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 OUTPUT_CSV = "market_data.csv"
 OUTPUT_META = "market_data_meta.json"
 FAILED_LOG = "fetch_failed.txt"
+SKIPPED_LOG = "fetch_skipped_no_equity.txt"
 
 # ============================================================
 # 1. Listas de tickers por índice
@@ -219,6 +220,15 @@ def fetch_stock_data(item, max_retries=4):
                     continue
                 return {"__error__": ticker, "__reason__": last_error}
 
+            # Descarta acciones preferentes, warrants, ETFs, etc. Estos
+            # instrumentos no tienen fundamentales comparables (Market
+            # Cap, Debt/Equity, PER forward...) porque no son la acción
+            # ordinaria de la empresa -> salían con huecos en cascada en
+            # el CSV. Nos interesa solo EQUITY normal.
+            quote_type = info.get("quoteType")
+            if quote_type and quote_type != "EQUITY":
+                return {"__skipped__": ticker, "__reason__": f"quoteType={quote_type}, no es acción ordinaria"}
+
             mcap = info.get("marketCap")
             fcf = info.get("freeCashflow")
             p_fcf = (mcap / fcf) if (mcap and fcf and fcf > 0) else None
@@ -318,8 +328,9 @@ def main():
             if done < len(all_indexed):
                 time.sleep(5)  # pausa entre lotes para no saturar Yahoo
 
-    ok = [r for r in results if r is not None and "__error__" not in r]
+    ok = [r for r in results if r is not None and "__error__" not in r and "__skipped__" not in r]
     failed = [r for r in results if r is not None and "__error__" in r]
+    skipped = [r for r in results if r is not None and "__skipped__" in r]
 
     df = pd.DataFrame(ok)
     df.to_csv(OUTPUT_CSV, index=False)
@@ -329,20 +340,32 @@ def main():
         "total_attempted": len(all_indexed),
         "total_ok": len(ok),
         "total_failed": len(failed),
+        "total_skipped_no_equity": len(skipped),
     }
     with open(OUTPUT_META, "w") as f:
         json.dump(meta, f, indent=2)
 
     # Guarda ticker + motivo, para poder distinguir de un vistazo un
     # ticker realmente deslistado/mal escrito de un 404 transitorio de
-    # Yahoo que no se resolvió ni tras los reintentos.
+    # Yahoo que no se resolvió ni tras los reintentos. Los excluidos por
+    # no ser EQUITY (preferentes, warrants...) van en su propio log,
+    # porque no son un fallo -- es un filtro intencionado.
     with open(FAILED_LOG, "w") as f:
         for r in failed:
             f.write(f"{r['__error__']}\t{r.get('__reason__', '')}\n")
 
-    print(f"Hecho: {len(ok)} ok, {len(failed)} fallidos. Guardado en {OUTPUT_CSV}")
+    with open(SKIPPED_LOG, "w") as f:
+        for r in skipped:
+            f.write(f"{r['__skipped__']}\t{r.get('__reason__', '')}\n")
+
+    print(
+        f"Hecho: {len(ok)} ok, {len(failed)} fallidos, "
+        f"{len(skipped)} excluidos (no son acción ordinaria). Guardado en {OUTPUT_CSV}"
+    )
     if failed:
         print(f"  (motivos de los fallos en {FAILED_LOG})")
+    if skipped:
+        print(f"  (excluidos -preferentes/warrants/etc- en {SKIPPED_LOG})")
 
 
 if __name__ == "__main__":
