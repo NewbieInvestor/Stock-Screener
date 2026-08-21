@@ -1,9 +1,7 @@
 """
-App Streamlit para explorar interactivamente market_data.csv (generado
-por fetch_data.py). Permite filtrar por índice, valoración, crecimiento
-y calidad, y al seleccionar una empresa muestra una ficha estilo
-Finviz/ScreenerHero con gráfico de precio y métricas financieras detalladas.
-Incluye módulo de Análisis Profundo (DCF y ROIC).
+App Streamlit para explorar interactivamente market_data.csv.
+Incluye Módulo de Análisis Profundo con Valoración Triple (DCF, PER Histórico con EPS Actual
+y PER Histórico con EPS a 5 Años) junto con ROIC Exacto.
 """
 
 import pandas as pd
@@ -15,7 +13,7 @@ st.set_page_config(page_title="Stock Screener", layout="wide")
 
 DATA_CSV = "market_data.csv"
 
-# --- CONSTANTES PARA EL DCF ---
+# --- CONSTANTES PARA EL DCF Y VALORACIONES ---
 WACC = 0.10              # Tasa de descuento (10%)
 TERMINAL_GROWTH = 0.025  # Crecimiento a perpetuidad (2.5%)
 PROJECTION_YEARS = 5     # Años a proyectar
@@ -95,9 +93,41 @@ def get_df_row(df, keywords):
                 return s
     return None
 
+def get_historical_pe(ticker_obj, years=5):
+    """Calcula la media del PER histórico propio de la empresa cruzando EPS anual y precios mensuales."""
+    try:
+        inc_stmt = ticker_obj.income_stmt
+        if inc_stmt is None or inc_stmt.empty:
+            return None
+
+        eps_row = get_df_row(inc_stmt, ["diluted eps", "basic eps", "beneficio por accion"])
+        if eps_row is None:
+            return None
+
+        hist = ticker_obj.history(period=f"{years}y", interval="1mo")
+        if hist.empty:
+            return None
+
+        annual_pes = []
+        for date, eps in eps_row.items():
+            if pd.notna(eps) and eps > 0:
+                year = date.year
+                year_prices = hist.loc[hist.index.year == year, "Close"]
+                if not year_prices.empty:
+                    avg_price = year_prices.mean()
+                    pe_year = avg_price / eps
+                    if 2 < pe_year < 150:  # Filtrar anomalías numéricas puntuales
+                        annual_pes.append(pe_year)
+
+        if annual_pes:
+            return sum(annual_pes) / len(annual_pes)
+    except Exception:
+        pass
+    return None
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_deep_metrics(ticker, current_price):
-    """Calcula ROIC exacto y DCF extrayendo balances con adaptaciones para Financieras, REITs y Tickers Europeos."""
+    """Calcula ROIC exacto, PER Histórico propio y Valor Intrínseco por DCF, EPS Actual y EPS 5Y."""
     t = yf.Ticker(ticker)
     info = {}
     try:
@@ -108,7 +138,6 @@ def get_deep_metrics(ticker, current_price):
     sector = str(info.get("sector", ""))
     industry = str(info.get("industry", ""))
     
-    # Identificar empresas financieras o REITs donde la deuda es apalancamiento operativo
     is_financial_or_reit = (
         "financial" in sector.lower() 
         or "real estate" in sector.lower() 
@@ -117,15 +146,15 @@ def get_deep_metrics(ticker, current_price):
         or "mortgage" in industry.lower()
     )
     
-    # 1. Calcular ROIC Exacto
+    # 1. ROIC Exacto
     roic = None
     try:
         inc_stmt = t.income_stmt
         bal_sheet = t.balance_sheet
         
-        ebit_row = get_df_row(inc_stmt, ["ebit", "operating income", "operating revenue", "resultado de explotacion"])
-        pretax_row = get_df_row(inc_stmt, ["pretax income", "income before tax", "resultado antes de impuestos"])
-        tax_row = get_df_row(inc_stmt, ["tax provision", "income tax expense", "impuestos sobre beneficios"])
+        ebit_row = get_df_row(inc_stmt, ["ebit", "operating income", "resultado de explotacion"])
+        pretax_row = get_df_row(inc_stmt, ["pretax income", "income before tax"])
+        tax_row = get_df_row(inc_stmt, ["tax provision", "income tax expense"])
 
         ebit = ebit_row.iloc[0] if ebit_row is not None else None
         pretax = pretax_row.iloc[0] if pretax_row is not None else None
@@ -137,9 +166,9 @@ def get_deep_metrics(ticker, current_price):
 
         nopat = ebit * (1 - tax_rate) if ebit is not None else None
 
-        debt_row = get_df_row(bal_sheet, ["total debt", "long term debt", "net debt", "deuda total"])
-        equity_row = get_df_row(bal_sheet, ["stockholders equity", "total stockholder equity", "common stock equity", "total equity", "patrimonio neto"])
-        cash_row = get_df_row(bal_sheet, ["cash and cash equivalents", "cash cash equivalents", "cash financial", "efectivo"])
+        debt_row = get_df_row(bal_sheet, ["total debt", "long term debt", "deuda total"])
+        equity_row = get_df_row(bal_sheet, ["stockholders equity", "total equity", "patrimonio neto"])
+        cash_row = get_df_row(bal_sheet, ["cash and cash equivalents", "efectivo"])
 
         total_debt = debt_row.iloc[0] if debt_row is not None else 0
         total_equity = equity_row.iloc[0] if equity_row is not None else None
@@ -152,9 +181,8 @@ def get_deep_metrics(ticker, current_price):
     except Exception:
         pass
         
-    # 2. Calcular DCF
-    intrinsic_value = None
-    mos = None
+    # 2. DCF (FCF Medio 3 Años)
+    intrinsic_dcf = None
     status_note = None
 
     try:
@@ -162,23 +190,18 @@ def get_deep_metrics(ticker, current_price):
         fcf_series = get_df_row(cash_flow, ["free cash flow", "flujo de caja libre"])
 
         if fcf_series is None:
-            ocf_row = get_df_row(cash_flow, ["operating cash flow", "operating cash", "cash flow from continued operating", "flujo de caja operativo"])
-            capex_row = get_df_row(cash_flow, ["capital expenditure", "capital expenditures", "capex", "inversiones en inmovilizado"])
+            ocf_row = get_df_row(cash_flow, ["operating cash flow"])
+            capex_row = get_df_row(cash_flow, ["capital expenditure", "capex"])
             if ocf_row is not None:
-                if capex_row is not None:
-                    fcf_series = ocf_row + capex_row # CapEx suele ser negativo
-                else:
-                    fcf_series = ocf_row
+                fcf_series = ocf_row + capex_row if capex_row is not None else ocf_row
 
         if fcf_series is not None and len(fcf_series) > 0:
-            historical_fcf = fcf_series.head(3)
-            mean_fcf = historical_fcf.mean()
+            mean_fcf = fcf_series.head(3).mean()
 
             if mean_fcf <= 0:
                 status_note = "FCF Negativo"
             else:
-                fcf_growth = 0.05
-                projected_fcf = [mean_fcf * ((1 + fcf_growth) ** i) for i in range(1, PROJECTION_YEARS + 1)]
+                projected_fcf = [mean_fcf * ((1 + 0.05) ** i) for i in range(1, PROJECTION_YEARS + 1)]
                 discounted_fcf = sum([f / ((1 + WACC) ** i) for i, f in enumerate(projected_fcf, 1)])
 
                 terminal_val = (projected_fcf[-1] * (1 + TERMINAL_GROWTH)) / (WACC - TERMINAL_GROWTH)
@@ -188,35 +211,42 @@ def get_deep_metrics(ticker, current_price):
 
                 shares_out = info.get("sharesOutstanding")
                 if not shares_out:
-                    shares_row = get_df_row(t.balance_sheet, ["share issued", "ordinary shares number", "acciones"])
+                    shares_row = get_df_row(t.balance_sheet, ["share issued", "ordinary shares number"])
                     if shares_row is not None:
                         shares_out = shares_row.iloc[0]
 
-                if is_financial_or_reit:
-                    # En financieras/REITs, el flujo se valora directamente sobre Equity
-                    equity_value = enterprise_value
-                else:
-                    debt_row = get_df_row(t.balance_sheet, ["total debt", "long term debt", "deuda total"])
-                    cash_row = get_df_row(t.balance_sheet, ["cash and cash equivalents", "cash cash equivalents", "efectivo"])
-                    total_debt = debt_row.iloc[0] if debt_row is not None else 0
-                    cash = cash_row.iloc[0] if cash_row is not None else 0
-                    
-                    equity_value = enterprise_value - total_debt + cash
+                equity_value = enterprise_value if is_financial_or_reit else (enterprise_value - total_debt + cash)
 
                 if shares_out and shares_out > 0:
                     iv = equity_value / shares_out
                     if iv > 0:
-                        intrinsic_value = iv
-                        if current_price and current_price > 0:
-                            mos = ((intrinsic_value - current_price) / intrinsic_value) * 100
+                        intrinsic_dcf = iv
                     else:
-                        status_note = "IV Negativo"
+                        status_note = "IV DCF Negativo"
         else:
             status_note = "Sin datos FCF"
     except Exception:
-        status_note = "Error datos"
+        status_note = "Error DCF"
 
-    return roic, intrinsic_value, mos, status_note
+    # 3. PER Histórico Propio y Valoración por EPS
+    pe_hist = get_historical_pe(t)
+    iv_pe_actual = None
+    iv_pe_growth = None
+    
+    eps_trailing = info.get("trailingEps")
+    if not eps_trailing and t.income_stmt is not None:
+        eps_row = get_df_row(t.income_stmt, ["diluted eps", "basic eps"])
+        if eps_row is not None:
+            eps_trailing = eps_row.iloc[0]
+
+    if eps_trailing and eps_trailing > 0 and pe_hist:
+        iv_pe_actual = eps_trailing * pe_hist
+        
+        future_eps = eps_trailing * ((1 + 0.05) ** PROJECTION_YEARS)
+        future_price = future_eps * pe_hist
+        iv_pe_growth = future_price / ((1 + WACC) ** PROJECTION_YEARS)
+
+    return roic, intrinsic_dcf, pe_hist, iv_pe_actual, iv_pe_growth, status_note
 
 def fmt_val(val, is_pct=False, is_money=False, multiplier=1.0):
     if val is None or pd.isna(val):
@@ -304,10 +334,7 @@ def main():
     try:
         df = load_data()
     except FileNotFoundError:
-        st.error(
-            f"No se encuentra {DATA_CSV} en esta carpeta. "
-            "Ejecuta fetch_data.py primero."
-        )
+        st.error(f"No se encuentra {DATA_CSV} en esta carpeta. Ejecuta fetch_data.py primero.")
         return
 
     ignorar_na = st.checkbox(
@@ -407,20 +434,23 @@ def main():
 
     # --- SECCIÓN: ANÁLISIS PROFUNDO ---
     st.markdown("---")
-    st.subheader("🧠 Análisis Profundo (DCF y ROIC Exacto)")
-    st.write("Calcula el Valor Intrínseco y ROIC real conectándose directamente a los balances reportados.")
+    st.subheader("🧠 Análisis Profundo (DCF, PER Histórico y ROIC Exacto)")
+    st.write("Calcula el Valor Intrínseco por múltiples métodos (DCF, PER con EPS actual y PER con EPS proyectado a 5 años) junto con el PER histórico propio y ROIC real.")
     
-    with st.expander("ℹ️ ¿Cómo se calculan el Valor Intrínseco (DCF) y el ROIC?"):
+    with st.expander("ℹ️ ¿Cómo se calculan las métricas del Análisis Profundo?"):
         st.markdown("""
-        **1. Valor Intrínseco (Modelo de Descuento de Flujos de Caja - DCF):**
-        * **Base de FCF:** Promedio del Free Cash Flow de los últimos 3 años (o Flujo Operativo - CapEx).
-        * **Proyección (5 años):** Proyectado a una tasa de crecimiento conservadora del **5% anual**.
-        * **Tasa de Descuento (WACC):** Descuento al **10% anual**.
-        * **Valor Terminal:** Método Gordon Growth a un **2.5% de crecimiento perpetuo**.
-        * **Ajuste para Industriales/Consumo:** $\\text{Enterprise Value} + \\text{Caja} - \\text{Deuda Total} = \\text{Equity Value}$.
-        * **Ajuste para Financieras/REITs:** Dado que la deuda es su capital operativo de negocio, el flujo proyectado computa directamente como $\\text{Equity Value}$.
+        **1. Valor Intrínseco DCF (Flujos de Caja):**
+        * Basado en la media del FCF de los últimos 3 años proyectado al **5% anual** durante 5 años.
+        * Descontado al **10% anual (WACC)** con valor terminal al **2.5% de crecimiento perpetuo**.
 
-        **2. Rentabilidad sobre el Capital Invertido (ROIC Exacto):**
+        **2. PER Histórico Propio (5 Años):**
+        * Calcula el PER medio real de la propia empresa cruzando sus precios de cierre mensuales con sus beneficios anuales (EPS) de los últimos 5 años.
+
+        **3. Valoración por PER y Beneficios (EPS):**
+        * **IV PER (EPS Actual):** $\\text{EPS Actual} \\times \\text{PER Histórico}$.
+        * **IV PER (EPS 5Y Growth):** $\\text{EPS Proyectado al 5\\% a 5 años} \\times \\text{PER Histórico}$ descontado al $10\\%$ anual.
+
+        **4. Rentabilidad sobre Capital Invertido (ROIC Exacto):**
         $$ROIC = \\frac{\\text{NOPAT}}{\\text{Capital Invertido}} = \\frac{\\text{EBIT} \\times (1 - \\text{Tasa Impositiva})}{\\text{Deuda Total} + \\text{Patrimonio Neto} - \\text{Caja}}$$
         """)
 
@@ -441,19 +471,17 @@ def main():
                 nombre = resultado.loc[resultado["Ticker"] == ticker, "Nombre"].values[0]
                 precio_actual = resultado.loc[resultado["Ticker"] == ticker, "Precio"].values[0]
                 
-                roic, intrinsic, mos, note = get_deep_metrics(ticker, precio_actual)
+                roic, iv_dcf, pe_hist, iv_pe_act, iv_pe_gro, note = get_deep_metrics(ticker, precio_actual)
                 
-                iv_str = round(intrinsic, 2) if intrinsic is not None else (note if note else "N/A")
-                mos_str = round(mos, 2) if mos is not None else "N/A"
-                roic_str = round(roic, 2) if roic is not None else "N/A"
-
                 deep_results.append({
                     "Ticker": ticker,
                     "Nombre": nombre,
                     "Precio Actual": round(precio_actual, 2) if pd.notna(precio_actual) else "N/A",
-                    "Valor Intrínseco": iv_str,
-                    "Margen de Seguridad (%)": mos_str,
-                    "ROIC Exacto (%)": roic_str
+                    "PER Hist. Medio": round(pe_hist, 1) if pe_hist else "N/A",
+                    "IV DCF (FCF)": round(iv_dcf, 2) if iv_dcf else (note if note else "N/A"),
+                    "IV PER (EPS Actual)": round(iv_pe_act, 2) if iv_pe_act else "N/A",
+                    "IV PER (EPS 5Y Growth)": round(iv_pe_gro, 2) if iv_pe_gro else "N/A",
+                    "ROIC Exacto (%)": round(roic, 2) if roic else "N/A"
                 })
             
             progress_bar.empty()
