@@ -199,19 +199,19 @@ def get_sp500_tickers():
 
 def get_spain_tickers():
     tickers = [
-        # IBEX 35 (verificado agosto 2026)
+        # IBEX 35 
         "SAN.MC", "BBVA.MC", "TEF.MC", "ITX.MC", "IBE.MC", "REP.MC", "AMS.MC",
-        "CABK.MC", "SAB.MC", "FER.MC", "ACS.MC", "AENA.MC", "ELE.MC", "REDE.MC",
+        "CABK.MC", "SAB.MC", "FER.MC", "ACS.MC", "AENA.MC", "ELE.MC", "RED.MC", # Corregido REDE.MC -> RED.MC
         "MAP.MC", "COL.MC", "CLNX.MC", "FDR.MC", "GRF.MC", "ROVI.MC", "BKT.MC",
         "ANA.MC", "ENG.MC", "IAG.MC", "IDR.MC", "LOG.MC",
         "UNI.MC", "SLR.MC", "SCYR.MC", "ACX.MC", "NTGY.MC", "MTS.MC", "MRL.MC",
         "ANE.MC", "PUIG.MC",
-        # Mercado Continuo (Medium & Small Caps) — SIN verificar exhaustivamente
-        "MTS.MC", "ALM.MC", "FAES.MC", "GRE.MC", "GEST.MC", "TLGO.MC",
-        "TUB.MC", "OHLA.MC", "FCC.MC", "A3M.MC", "LDA.MC", "DOM.MC", "NRE.MC",
-        "MVC.MC", "AFL.MC", "AZK.MC", "EZE.MC", "AMP.MC", "MDF.MC", "PRS.MC",
-        "R4.MC", "GVC.MC", "AUD.MC", "ECO.MC", "CLE.MC", "TRG.MC", "OLE.MC",
-        "NLG.MC", "ORY.MC", "RLIA.MC", "SPS.MC", "ALNT.MC", "LGT.MC", "DIA.MC",
+        # Mercado Continuo (Corregido)
+        "ALM.MC", "FAE.MC", "GRE.MC", "GEST.MC", "TLGO.MC", # Corregido FAES.MC -> FAE.MC
+        "TUB.MC", "OHLA.MC", "FCC.MC", "A3M.MC", "LDA.MC", "DOM.MC", "NTH.MC", # Corregido NRE.MC -> NTH.MC (Naturhouse)
+        "MVC.MC", "AZK.MC", "EZE.MC", "AMP.MC", "MDF.MC", "PRS.MC",
+        "R4.MC", "ADX.MC", "ECO.MC", "CLEO.MC", "TRG.MC", "OLE.MC", # Corregido AUD.MC -> ADX.MC, CLE.MC -> CLEO.MC
+        "AI.MC", "ORY.MC", "RLIA.MC", "ALNT.MC", "LGT.MC", "DIA.MC", # Corregido NLG.MC -> AI.MC
         "MEL.MC", "VIS.MC", "PHM.MC", "CAF.MC", "EBRO.MC",
     ]
     return _validate_format(_dedupe(tickers), "España")
@@ -479,6 +479,10 @@ def extract_metrics(ticker, index_name, info):
     price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
     mcap = info.get("marketCap")
     mcap_b = (mcap / 1e9) if mcap else None
+    
+    # Cálculo de P/FCF usando el freeCashflow si está disponible
+    fcf = info.get("freeCashflow")
+    p_fcf = (mcap / fcf) if (mcap and fcf and fcf > 0) else None
 
     return {
         "Ticker": ticker,
@@ -493,12 +497,12 @@ def extract_metrics(ticker, index_name, info):
         "EV/Sales": info.get("enterpriseToRevenue"),
         "P/S": info.get("priceToSalesTrailing12Months"),
         "P/B": info.get("priceToBook"),
-        "P/FCF": None,
+        "P/FCF": p_fcf, # ¡Columna arreglada!
         "Crec. Ventas YoY (%)": (info.get("revenueGrowth") * 100) if info.get("revenueGrowth") is not None else None,
-        "Crec. Ventas 3Y (%)": None,
+        "Crec. Ventas 3Y (%)": None, # Requiere histórico profundo
         "Crec. EPS YoY (%)": (info.get("earningsGrowth") * 100) if info.get("earningsGrowth") is not None else None,
-        "Crec. EPS 3Y (%)": None,
-        "ROIC (%)": None,
+        "Crec. EPS 3Y (%)": None, # Requiere histórico profundo
+        "ROIC (%)": info.get("returnOnCapitalEmployed") * 100 if info.get("returnOnCapitalEmployed") is not None else None, # A veces yfinance lo da como ROCE
         "ROE (%)": (info.get("returnOnEquity") * 100) if info.get("returnOnEquity") is not None else None,
         "ROA (%)": (info.get("returnOnAssets") * 100) if info.get("returnOnAssets") is not None else None,
         "Margen Bruto (%)": (info.get("grossMargins") * 100) if info.get("grossMargins") is not None else None,
