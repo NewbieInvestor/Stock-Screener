@@ -3,9 +3,7 @@ App Streamlit para explorar interactivamente market_data.csv (generado
 por fetch_data.py). Permite filtrar por índice, valoración, crecimiento
 y calidad, y al seleccionar una empresa muestra una ficha estilo
 Finviz/ScreenerHero con gráfico de precio y métricas financieras detalladas.
-
-Uso:
-    streamlit run app.py
+Incluye módulo de Análisis Profundo (DCF y ROIC).
 """
 
 import pandas as pd
@@ -17,21 +15,22 @@ st.set_page_config(page_title="Stock Screener", layout="wide")
 
 DATA_CSV = "market_data.csv"
 
+# --- CONSTANTES PARA EL DCF ---
+WACC = 0.10              # Tasa de descuento (10%)
+TERMINAL_GROWTH = 0.025  # Crecimiento a perpetuidad (2.5%)
+PROJECTION_YEARS = 5     # Años a proyectar
 
 @st.cache_data(ttl=3600)
 def load_data():
     return pd.read_csv(DATA_CSV)
 
-
 @st.cache_data(ttl=1800)
 def load_price_history(ticker, period="1y"):
     return yf.Ticker(ticker).history(period=period)
 
-
 @st.cache_data(ttl=3600)
 def load_ticker_extra(ticker):
-    """Datos adicionales de Yahoo Finance para la ficha completa (Ownership, 
-    Cash Flow, Balance Sheet, Consenso de analistas, etc.)."""
+    """Datos adicionales de Yahoo Finance para la ficha completa."""
     try:
         info = yf.Ticker(ticker).info
     except Exception:
@@ -44,8 +43,6 @@ def load_ticker_extra(ticker):
         "resumen": info.get("longBusinessSummary", ""),
         "web": info.get("website", ""),
         "country": info.get("country", "-"),
-        
-        # Valoración / Objetivos
         "target_price": info.get("targetMeanPrice"),
         "target_high": info.get("targetHighPrice"),
         "target_low": info.get("targetLowPrice"),
@@ -54,8 +51,6 @@ def load_ticker_extra(ticker):
         "beta": info.get("beta"),
         "52w_high": info.get("fiftyTwoWeekHigh"),
         "52w_low": info.get("fiftyTwoWeekLow"),
-        
-        # Profitability & Growth
         "rev_growth": info.get("revenueGrowth"),
         "earnings_growth": info.get("earningsGrowth"),
         "gross_margins": info.get("grossMargins"),
@@ -64,43 +59,94 @@ def load_ticker_extra(ticker):
         "ebitda_margins": info.get("ebitdaMargins"),
         "roa": info.get("returnOnAssets"),
         "roe": info.get("returnOnEquity"),
-        
-        # Cash Flow & Leverage
         "operating_cf": info.get("operatingCashflow"),
         "free_cf": info.get("freeCashflow"),
         "total_debt": info.get("totalDebt"),
         "total_cash": info.get("totalCash"),
         "ebitda": info.get("ebitda"),
-        
-        # Balance Sheet
         "debt_to_equity": info.get("debtToEquity"),
         "current_ratio": info.get("currentRatio"),
         "quick_ratio": info.get("quickRatio"),
         "book_value": info.get("bookValue"),
         "cash_per_share": info.get("totalCashPerShare"),
-        
-        # Ownership
         "shares_out": info.get("sharesOutstanding"),
         "float_shares": info.get("floatShares"),
         "insiders_pct": info.get("heldPercentInsiders"),
         "institutions_pct": info.get("heldPercentInstitutions"),
-        
-        # Short Interest
         "short_ratio": info.get("shortRatio"),
         "short_pct_float": info.get("shortPercentOfFloat"),
         "shares_short": info.get("sharesShort"),
         "shares_short_prior": info.get("sharesShortPriorMonth"),
-        
-        # Dividends
         "div_rate": info.get("dividendRate"),
         "trail_div_rate": info.get("trailingAnnualDividendRate"),
         "div_yield": info.get("dividendYield"),
         "payout_ratio": info.get("payoutRatio"),
     }
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_deep_metrics(ticker, current_price):
+    """Calcula ROIC exacto y DCF extrayendo balances pesados."""
+    t = yf.Ticker(ticker)
+    
+    # 1. Calcular ROIC Exacto
+    roic = None
+    try:
+        inc_stmt = t.income_stmt
+        bal_sheet = t.balance_sheet
+        if not inc_stmt.empty and not bal_sheet.empty:
+            ebit = inc_stmt.loc["EBIT"].iloc[0] if "EBIT" in inc_stmt.index else inc_stmt.loc["Operating Income"].iloc[0]
+            pretax_income = inc_stmt.loc["Pretax Income"].iloc[0]
+            tax_provision = inc_stmt.loc["Tax Provision"].iloc[0]
+            tax_rate = tax_provision / pretax_income if pretax_income > 0 else 0.21
+            nopat = ebit * (1 - tax_rate)
+            
+            total_debt = bal_sheet.loc["Total Debt"].iloc[0] if "Total Debt" in bal_sheet.index else 0
+            total_equity = bal_sheet.loc["Stockholders Equity"].iloc[0]
+            cash = bal_sheet.loc["Cash And Cash Equivalents"].iloc[0] if "Cash And Cash Equivalents" in bal_sheet.index else 0
+            
+            invested_capital = total_debt + total_equity - cash
+            if invested_capital > 0:
+                roic = (nopat / invested_capital) * 100
+    except Exception:
+        pass
+        
+    # 2. Calcular DCF
+    intrinsic_value = None
+    mos = None
+    try:
+        cash_flow = t.cash_flow
+        info = t.info
+        if not cash_flow.empty and "Free Cash Flow" in cash_flow.index:
+            historical_fcf = cash_flow.loc["Free Cash Flow"].dropna().head(3)
+            if len(historical_fcf) > 0 and historical_fcf.mean() > 0:
+                base_fcf = historical_fcf.mean()
+                fcf_growth = 0.05 # Crecimiento conservador
+                
+                projected_fcf = [base_fcf * ((1 + fcf_growth) ** i) for i in range(1, PROJECTION_YEARS + 1)]
+                discounted_fcf = sum([fcf / ((1 + WACC) ** i) for i, fcf in enumerate(projected_fcf, 1)])
+                
+                terminal_value = (projected_fcf[-1] * (1 + TERMINAL_GROWTH)) / (WACC - TERMINAL_GROWTH)
+                discounted_tv = terminal_value / ((1 + WACC) ** PROJECTION_YEARS)
+                
+                enterprise_value = discounted_fcf + discounted_tv
+                
+                bal_sheet = t.balance_sheet
+                total_debt = bal_sheet.loc["Total Debt"].iloc[0] if "Total Debt" in bal_sheet.index else 0
+                cash = bal_sheet.loc["Cash And Cash Equivalents"].iloc[0] if "Cash And Cash Equivalents" in bal_sheet.index else 0
+                
+                equity_value = enterprise_value - total_debt + cash
+                shares_out = info.get("sharesOutstanding")
+                
+                if shares_out:
+                    intrinsic_value = equity_value / shares_out
+                    if intrinsic_value > 0 and current_price:
+                        mos = ((intrinsic_value - current_price) / intrinsic_value) * 100
+    except Exception:
+        pass
+        
+    return roic, intrinsic_value, mos
 
 def fmt_val(val, is_pct=False, is_money=False, multiplier=1.0):
-    """Helper para formatear números de forma limpia (K, M, B, T, %)"""
     if val is None or pd.isna(val):
         return "—"
     try:
@@ -118,74 +164,12 @@ def fmt_val(val, is_pct=False, is_money=False, multiplier=1.0):
     except Exception:
         return str(val)
 
-
-VALUATION_PRESETS = [
-    ("Cualquiera", None, None),
-    ("Positivo (>0)", 0, None),
-    ("Bajo (<10)", None, 10),
-    ("Bajo (<15)", None, 15),
-    ("Bajo (<20)", None, 20),
-    ("Bajo (<30)", None, 30),
-    ("Bajo (<50)", None, 50),
-    ("Alto (>50)", 50, None),
-    ("Negativo (<0)", None, 0),
-    ("Personalizado", "custom", "custom"),
-]
-
-GROWTH_PRESETS = [
-    ("Cualquiera", None, None),
-    ("Positivo (>0%)", 0, None),
-    ("Over 5%", 5, None),
-    ("Over 10%", 10, None),
-    ("Over 15%", 15, None),
-    ("Over 20%", 20, None),
-    ("Over 30%", 30, None),
-    ("Over 50%", 50, None),
-    ("Negativo (<0%)", None, 0),
-    ("Personalizado", "custom", "custom"),
-]
-
-RATIO_PRESETS = [
-    ("Cualquiera", None, None),
-    ("Bajo (<1)", None, 1),
-    ("Bajo (<2)", None, 2),
-    ("Moderado (<0.5)", None, 0.5),
-    ("Alto (>2)", 2, None),
-    ("Personalizado", "custom", "custom"),
-]
-
-PB_PRESETS = [
-    ("Cualquiera", None, None),
-    ("Positivo (>0)", 0, None),
-    ("Bajo (<1)", None, 1),
-    ("Bajo (<2)", None, 2),
-    ("Bajo (<3)", None, 3),
-    ("Bajo (<5)", None, 5),
-    ("Bajo (<10)", None, 10),
-    ("Alto (>10)", 10, None),
-    ("Negativo (<0)", None, 0),
-    ("Personalizado", "custom", "custom"),
-]
-
-MCAP_PRESETS = [
-    ("Cualquiera", None, None),
-    ("Mega (200bln+)", 200, None),
-    ("Large (10bln-200bln)", 10, 200),
-    ("Mid (2bln-10bln)", 2, 10),
-    ("Small (300mln-2bln)", 0.3, 2),
-    ("Micro (50mln-300mln)", 0.05, 0.3),
-    ("Nano (under 50mln)", None, 0.05),
-    ("+Large (over 10bln)", 10, None),
-    ("+Mid (over 2bln)", 2, None),
-    ("+Small (over 300mln)", 0.3, None),
-    ("+Micro (over 50mln)", 0.05, None),
-    ("-Large (under 200bln)", None, 200),
-    ("-Mid (under 10bln)", None, 10),
-    ("-Small (under 2bln)", None, 2),
-    ("-Micro (under 300mln)", None, 0.3),
-    ("Personalizado", "custom", "custom"),
-]
-
+# PRESETS DE FILTROS
+VALUATION_PRESETS = [("Cualquiera", None, None), ("Positivo (>0)", 0, None), ("Bajo (<10)", None, 10), ("Bajo (<15)", None, 15), ("Bajo (<20)", None, 20), ("Bajo (<30)", None, 30), ("Bajo (<50)", None, 50), ("Alto (>50)", 50, None), ("Negativo (<0)", None, 0), ("Personalizado", "custom", "custom")]
+GROWTH_PRESETS = [("Cualquiera", None, None), ("Positivo (>0%)", 0, None), ("Over 5%", 5, None), ("Over 10%", 10, None), ("Over 15%", 15, None), ("Over 20%", 20, None), ("Over 30%", 30, None), ("Over 50%", 50, None), ("Negativo (<0%)", None, 0), ("Personalizado", "custom", "custom")]
+RATIO_PRESETS = [("Cualquiera", None, None), ("Bajo (<1)", None, 1), ("Bajo (<2)", None, 2), ("Moderado (<0.5)", None, 0.5), ("Alto (>2)", 2, None), ("Personalizado", "custom", "custom")]
+PB_PRESETS = [("Cualquiera", None, None), ("Positivo (>0)", 0, None), ("Bajo (<1)", None, 1), ("Bajo (<2)", None, 2), ("Bajo (<3)", None, 3), ("Bajo (<5)", None, 5), ("Bajo (<10)", None, 10), ("Alto (>10)", 10, None), ("Negativo (<0)", None, 0), ("Personalizado", "custom", "custom")]
+MCAP_PRESETS = [("Cualquiera", None, None), ("Mega (200bln+)", 200, None), ("Large (10bln-200bln)", 10, 200), ("Mid (2bln-10bln)", 2, 10), ("Small (300mln-2bln)", 0.3, 2), ("Micro (50mln-300mln)", 0.05, 0.3), ("Nano (under 50mln)", None, 0.05), ("+Large (over 10bln)", 10, None), ("+Mid (over 2bln)", 2, None), ("+Small (over 300mln)", 0.3, None), ("+Micro (over 50mln)", 0.05, None), ("-Large (under 200bln)", None, 200), ("-Mid (under 10bln)", None, 10), ("-Small (under 2bln)", None, 2), ("-Micro (under 300mln)", None, 0.3), ("Personalizado", "custom", "custom")]
 
 def finviz_filter(col, label, kind="growth", key_prefix=""):
     presets = {"valuation": VALUATION_PRESETS, "growth": GROWTH_PRESETS, "ratio": RATIO_PRESETS, "mcap": MCAP_PRESETS, "pb": PB_PRESETS}[kind]
@@ -206,7 +190,6 @@ def finviz_filter(col, label, kind="growth", key_prefix=""):
         return None
     return (lo, hi, label)
 
-
 def apply_finviz_filter(df, col, sel, allow_na=True):
     if sel is None:
         return pd.Series(True, index=df.index)
@@ -223,14 +206,11 @@ def apply_finviz_filter(df, col, sel, allow_na=True):
         mask = mask & serie.notna()
     return mask
 
-
 def render_block(title, items):
-    """Muestra un bloque de estadísticas con formato de clave - valor."""
     st.markdown(f"##### {title}")
     for label, val in items:
         st.markdown(f"**{label}:** {val}")
     st.markdown("---")
-
 
 def main():
     st.title("📊 Stock Screener")
@@ -240,7 +220,7 @@ def main():
     except FileNotFoundError:
         st.error(
             f"No se encuentra {DATA_CSV} en esta carpeta. "
-            "Ejecuta fetch_data.py primero (o run_screener.bat)."
+            "Ejecuta fetch_data.py primero."
         )
         return
 
@@ -256,9 +236,7 @@ def main():
 
     with tab_desc:
         indices_disponibles = sorted(df["Índice"].dropna().unique().tolist())
-        indices_sel = st.multiselect(
-            "Índices", indices_disponibles, default=indices_disponibles
-        )
+        indices_sel = st.multiselect("Índices", indices_disponibles, default=indices_disponibles)
         sels["Market Cap (B)"] = finviz_filter("Market Cap (B)", "Market Cap", "mcap", "desc")
 
     df_f = df[df["Índice"].isin(indices_sel)] if indices_sel else df.copy()
@@ -341,6 +319,47 @@ def main():
     st.subheader(f"Resultados: {len(resultado)} empresas")
     st.dataframe(resultado, use_container_width=True, height=350)
 
+    # --- SECCIÓN NUEVA: ANÁLISIS PROFUNDO ---
+    st.markdown("---")
+    st.subheader("🧠 Análisis Profundo (DCF y ROIC Exacto)")
+    st.write("Calcula el Valor Intrínseco y ROIC real para las empresas filtradas en la tabla de arriba conectándose a sus estados financieros.")
+    
+    if st.button("🚀 Ejecutar Análisis Profundo", type="primary"):
+        if len(resultado) == 0:
+            st.warning("⚠️ No hay ninguna empresa en los resultados para analizar.")
+        elif len(resultado) > 20:
+            st.warning(f"⚠️ Tienes {len(resultado)} empresas en pantalla. Por favor, usa los filtros de arriba para reducir la lista a un máximo de 20. Si haces más, Yahoo Finance podría bloquear tu conexión por hacer demasiadas peticiones de golpe.")
+        else:
+            deep_results = []
+            tickers_list = resultado["Ticker"].tolist()
+            
+            # Barra de progreso
+            progress_bar = st.progress(0, text="Iniciando conexión con balances...")
+            
+            for i, ticker in enumerate(tickers_list):
+                progress_bar.progress((i + 1) / len(tickers_list), text=f"Analizando {ticker} ({i+1}/{len(tickers_list)})...")
+                
+                nombre = resultado.loc[resultado["Ticker"] == ticker, "Nombre"].values[0]
+                precio_actual = resultado.loc[resultado["Ticker"] == ticker, "Precio"].values[0]
+                
+                roic, intrinsic, mos = get_deep_metrics(ticker, precio_actual)
+                
+                deep_results.append({
+                    "Ticker": ticker,
+                    "Nombre": nombre,
+                    "Precio Actual": round(precio_actual, 2) if pd.notna(precio_actual) else "N/A",
+                    "Valor Intrínseco": round(intrinsic, 2) if intrinsic else "N/A",
+                    "Margen de Seguridad (%)": round(mos, 2) if mos else "N/A",
+                    "ROIC Exacto (%)": round(roic, 2) if roic else "N/A"
+                })
+            
+            progress_bar.empty()
+            st.success("¡Análisis profundo completado! 🎉")
+            
+            df_deep = pd.DataFrame(deep_results)
+            st.dataframe(df_deep, use_container_width=True)
+
+    # --- SECCIÓN: FICHA DE EMPRESA ---
     st.markdown("---")
     st.subheader("🔎 Ficha de empresa")
 
@@ -354,7 +373,7 @@ def main():
         format_func=lambda t: f"{t} — {resultado.loc[resultado['Ticker'] == t, 'Nombre'].values[0]}",
     )
 
-    ver_ficha = st.button("🔎 Ver ficha", type="primary")
+    ver_ficha = st.button("🔎 Ver ficha", type="secondary")
 
     if not ticker_sel:
         return
@@ -383,7 +402,6 @@ def main():
         except Exception:
             hist = pd.DataFrame()
 
-    # --- SECCIÓN SUPERIOR: GRÁFICO Y RESUMEN ---
     st.markdown(f"### {row['Nombre']} ({ticker_sel})")
     st.caption(f"{row['Índice']}  ·  {extra.get('sector', '-')} / {extra.get('industria', '-')}  ·  País: {extra.get('country', '-')}")
 
@@ -405,10 +423,8 @@ def main():
         with st.expander("Descripción del negocio"):
             st.write(extra["resumen"])
 
-    # --- SECCIÓN INFERIOR: KEY STATISTICS EN BLOQUES (ESTILO FINVIZ) ---
     st.markdown("### 📋 Key Statistics")
 
-    # Cálculos derivados para Cash Flow y Deuda Neta
     total_cash = extra.get("total_cash")
     total_debt = extra.get("total_debt")
     ebitda = extra.get("ebitda")
@@ -418,9 +434,7 @@ def main():
 
     col1, col2, col3 = st.columns(3)
 
-    # COLUMNA 1: COMPANY, VALUATION, PROFITABILITY
     with col1:
-        # Obtener Market Cap con fallback por si viene vacío desde el CSV o yfinance
         mcap_val = row.get("Market Cap (B)")
         if (pd.isna(mcap_val) or mcap_val is None) and extra.get("shares_out") and row.get("Precio"):
             mcap_val = (row.get("Precio") * extra.get("shares_out")) / 1e9
@@ -454,7 +468,6 @@ def main():
             ("ROIC", fmt_val(row.get("ROIC (%)") / 100 if pd.notna(row.get("ROIC (%)")) else None, is_pct=True)),
         ])
 
-    # COLUMNA 2: GROWTH, CASH FLOW & LEVERAGE, BALANCE SHEET, DIVIDENDS
     with col2:
         render_block("GROWTH", [
             ("Revenue Growth", fmt_val(extra.get("rev_growth") or (row.get("Crec. Ventas YoY (%)") / 100 if pd.notna(row.get("Crec. Ventas YoY (%)")) else None), is_pct=True)),
@@ -487,7 +500,6 @@ def main():
             ("Payout Ratio", fmt_val(extra.get("payout_ratio") or (row.get("Payout Ratio (%)") / 100 if pd.notna(row.get("Payout Ratio (%)")) else None), is_pct=True)),
         ])
 
-    # COLUMNA 3: ANALYST CONSENSUS, OWNERSHIP, SHORT INTEREST
     with col3:
         render_block("ANALYST CONSENSUS", [
             ("Rating", extra.get("recommendation", "-")),
@@ -512,7 +524,6 @@ def main():
 
     if extra.get("web"):
         st.markdown(f"🔗 [Web corporativa]({extra['web']})")
-
 
 if __name__ == "__main__":
     main()
