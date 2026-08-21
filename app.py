@@ -127,7 +127,7 @@ def get_historical_pe(ticker_obj, years=5):
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_deep_metrics(ticker, current_price):
-    """Calcula ROIC exacto, PER Histórico propio y Valor Intrínseco por DCF, EPS Actual y EPS 5Y."""
+    """Calcula ROIC exacto, PER Histórico propio, FCF Medio y Valor Intrínseco por DCF, EPS Actual y EPS 5Y."""
     t = yf.Ticker(ticker)
     info = {}
     try:
@@ -184,6 +184,7 @@ def get_deep_metrics(ticker, current_price):
     # 2. DCF (FCF Medio 3 Años)
     intrinsic_dcf = None
     status_note = None
+    mean_fcf = None
 
     try:
         cash_flow = t.cash_flow
@@ -196,7 +197,7 @@ def get_deep_metrics(ticker, current_price):
                 fcf_series = ocf_row + capex_row if capex_row is not None else ocf_row
 
         if fcf_series is not None and len(fcf_series) > 0:
-            mean_fcf = fcf_series.head(3).mean()
+            mean_fcf = float(fcf_series.head(3).mean())
 
             if mean_fcf <= 0:
                 status_note = "FCF Negativo"
@@ -246,7 +247,7 @@ def get_deep_metrics(ticker, current_price):
         future_price = future_eps * pe_hist
         iv_pe_growth = future_price / ((1 + WACC) ** PROJECTION_YEARS)
 
-    return roic, intrinsic_dcf, pe_hist, iv_pe_actual, iv_pe_growth, status_note
+    return roic, intrinsic_dcf, pe_hist, iv_pe_actual, iv_pe_growth, status_note, mean_fcf
 
 def fmt_val(val, is_pct=False, is_money=False, multiplier=1.0):
     if val is None or pd.isna(val):
@@ -471,24 +472,25 @@ def main():
                 nombre = resultado.loc[resultado["Ticker"] == ticker, "Nombre"].values[0]
                 precio_actual = resultado.loc[resultado["Ticker"] == ticker, "Precio"].values[0]
                 
-                roic, iv_dcf, pe_hist, iv_pe_act, iv_pe_gro, note = get_deep_metrics(ticker, precio_actual)
-                
+                roic, iv_dcf, pe_hist, iv_pe_act, iv_pe_gro, note, mean_fcf = get_deep_metrics(ticker, precio_actual)
+
                 deep_results.append({
                     "Ticker": ticker,
                     "Nombre": nombre,
                     "Precio Actual": round(precio_actual, 2) if pd.notna(precio_actual) else "N/A",
-                    "PER Hist. Medio": round(pe_hist, 1) if pe_hist else "N/A",
+                    "FCF": fmt_val(mean_fcf, is_money=True) if mean_fcf is not None else "N/A",
                     "IV DCF (FCF)": round(iv_dcf, 2) if iv_dcf else (note if note else "N/A"),
+                    "PER Hist. Medio": round(pe_hist, 1) if pe_hist else "N/A",
                     "IV PER (EPS Actual)": round(iv_pe_act, 2) if iv_pe_act else "N/A",
                     "IV PER (EPS 5Y Growth)": round(iv_pe_gro, 2) if iv_pe_gro else "N/A",
                     "ROIC Exacto (%)": round(roic, 2) if roic else "N/A"
                 })
-            
+                           
             progress_bar.empty()
             st.success("¡Análisis profundo completado! 🎉")
             
             df_deep = pd.DataFrame(deep_results)
-            st.dataframe(df_deep, use_container_width=True)
+            st.dataframe(df_deep, hide_index=True, use_container_width=True)
 
     # --- SECCIÓN: FICHA DE EMPRESA ---
     st.markdown("---")
