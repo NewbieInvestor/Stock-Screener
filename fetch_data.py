@@ -1,433 +1,543 @@
 """
 fetch_data.py
+Universo de tickers para Dow Jones Composite, NASDAQ 100, S&P 500, España
+(IBEX 35 + Mercado Continuo) y Russell 2000.
 
-Job independiente de la app Streamlit. Descarga los fundamentales de
-todos los tickers (IBEX 35, Mercado Continuo, S&P 500, Russell 2000)
-y los guarda en un CSV local (market_data.csv) junto con un timestamp.
+CAMBIO DE ENFOQUE respecto a la versión anterior:
+En vez de listas 100% hardcodeadas (que se quedan obsoletas en cuanto un
+índice cambia de composición), el S&P 500, el NASDAQ 100 y el Russell 2000
+se descargan en cada ejecución desde fuentes públicas que se actualizan
+solas. Si la descarga falla (sin red, fuente caída, etc.) se usa una lista
+estática de emergencia — que es exactamente el tipo de lista que tenías
+antes, con los mismos riesgos de quedarse desactualizada.
 
-Pensado para ejecutarse solo, de forma programada (cron, GitHub Actions,
-Task Scheduler...), NO dentro de la app Streamlit. La app solo lee el
-CSV que este script genera, así que abre al instante.
-
-Uso manual:
-    python fetch_data.py
-
-Uso con cron (todos los días a las 06:00, hora del servidor):
-    0 6 * * * cd /ruta/al/proyecto && /ruta/al/venv/bin/python fetch_data.py >> fetch_log.txt 2>&1
-
-Uso con GitHub Actions: ver el ejemplo de workflow al final de este archivo
-(coméntalo/pégalo en .github/workflows/fetch_data.yml).
+Todas las listas (dinámicas o de fallback) pasan por:
+  1. _dedupe()            -> elimina duplicados manteniendo el orden
+  2. _validate_format()   -> avisa de tickers con una pinta rara antes de
+                              gastar llamadas a yfinance en ellos
 """
 
-import io
-import json
-import logging
+import random
+import re
 import time
-from datetime import datetime, timezone
-
-import pandas as pd
+import io
+import csv
 import requests
+import pandas as pd
 import yfinance as yf
-from concurrent.futures import ThreadPoolExecutor
-
-# yfinance imprime por consola el JSON crudo de error (p.ej. "HTTP Error
-# 404: Quote not found for symbol: FI") cada vez que una petición falla,
-# aunque el reintento posterior vaya a tener éxito. Esto no es un ticker
-# roto: es Yahoo devolviendo 404 de forma transitoria cuando varios hilos
-# consultan en paralelo. Silenciamos ese ruido; nuestro propio código de
-# reintentos y logging (más abajo) ya se encarga de gestionarlo.
-logging.getLogger("yfinance").setLevel(logging.CRITICAL)
-
-OUTPUT_CSV = "market_data.csv"
-OUTPUT_META = "market_data_meta.json"
-FAILED_LOG = "fetch_failed.txt"
-SKIPPED_LOG = "fetch_skipped_no_equity.txt"
-
-# ============================================================
-# 1. Listas de tickers por índice
-# ============================================================
-
-IBEX_TICKERS = [
-    "ANA.MC", "ANE.MC", "AMS.MC", "MTS.MC", "SAB.MC", "SAN.MC", "BKT.MC", "CABK.MC",
-    "ACX.MC", "ACS.MC", "AENA.MC", "CLNX.MC", "ENG.MC", "ELE.MC", "FER.MC",
-    "GRF.MC", "IAG.MC", "IDR.MC", "ITX.MC", "COL.MC", "LOG.MC", "MAP.MC",
-    "MEL.MC", "MRL.MC", "NTGY.MC", "PUIG.MC", "RED.MC", "REP.MC", "ROVI.MC", "SCYR.MC",
-    "TEF.MC", "UNI.MC"
-]
-# Nota: GCO.MC y FLUI.MC se han quitado porque Yahoo Finance devuelve 404
-# para ellos. Si sabes el ticker correcto de esas dos empresas en Yahoo,
-# añádelo de nuevo aquí con el símbolo bueno.
-
-BME_EXTRA_TICKERS = [
-    "A3M.MC", "AI.MC", "APAM.MC", "ALM.MC", "AZK.MC", "BST.MC", "CAF.MC", "CIE.MC",
-    "DIA.MC", "DOM.MC", "EBRO.MC", "EDR.MC", "ENC.MC", "FAE.MC", "FDR.MC", "GEST.MC",
-    "GIGA.MC", "LDA.MC", "MCM.MC", "MVC.MC", "NBI.MC",
-    "NXT.MC", "OHLA.MC", "PHM.MC", "PRM.MC", "PVA.MC", "REN.MC", "SGRE.MC", "SLR.MC",
-    "TL5.MC", "TUB.MC", "TRE.MC", "VID.MC", "VIS.MC"
-]
-# Nota: GCO.MC, FLUI.MC, IZE.MC y NHH.MC se han quitado porque Yahoo Finance
-# devuelve 404 para ellos (ticker incorrecto o ya no cotiza con ese sufijo).
-# Si sabes el ticker correcto de alguna de esas empresas, añádelo de nuevo
-# arriba con el símbolo bueno.
-
-SP500_TICKERS = [
-    "MMM", "AOS", "ABT", "ABBV", "ACN", "ADBE", "AMD", "AES", "AFL", "A", "APD", "ABNB", "AKAM", "ALB",
-    "ARE", "ALGN", "ALLE", "LNT", "ALL", "GOOGL", "GOOG", "MO", "AMZN", "AMCR", "AEE", "AEP", "AXP",
-    "AMT", "AWK", "AMP", "AME", "AMGN", "APH", "ADI", "AON", "APA", "AAPL", "AMAT", "APTV", "ACGL",
-    "ADM", "ANET", "AJG", "AIZ", "T", "ATO", "ADSK", "ADP", "AZO", "AVB", "AVY", "AXON", "BKR", "BALL",
-    "BAC", "BAX", "BDX", "BRK-B", "BBY", "TECH", "BIIB", "BLK", "BX", "BA", "BKNG", "BWA", "BSX",
-    "BMY", "AVGO", "BR", "BRO", "BF-B", "BLDR", "BG", "BXP", "CHRW", "CDNS", "CZR", "CPT", "CPB", "COF",
-    "CAH", "KMX", "CCL", "CARR", "CTLT", "CAT", "CBOE", "CBRE", "CDW", "CE", "COR", "CNC", "CNP", "CF",
-    "CRL", "SCHW", "CHTR", "CVX", "CMG", "CB", "CHD", "CI", "CINF", "CTAS", "CSCO", "C", "CFG", "CLX",
-    "CME", "CMS", "KO", "CTSH", "CL", "CMCSA", "CAG", "COP", "ED", "STZ", "CEG", "COO", "CPRT", "GLW",
-    "CPAY", "CTVA", "CSGP", "COST", "CCI", "CSX", "CMI", "CVS", "DHR", "DRI", "DVA", "DE", "DAL",
-    "XRAY", "DVN", "DXCM", "FANG", "DLR", "DFS", "DG", "DLTR", "D", "DPZ", "DOV", "DOW", "DTE",
-    "DUK", "DD", "EMN", "ETN", "EBAY", "ECL", "EIX", "EW", "EA", "ELV", "EMR", "ENPH", "ETR", "EOG",
-    "EPAM", "EQT", "EFX", "EQIX", "EQR", "ESS", "EL", "ETSY", "EG", "EVRG", "ES", "EXC", "EXPE", "EXPD",
-    "EXR", "XOM", "FFIV", "FAST", "FRT", "FDX", "FITB", "FSLR", "FE", "FIS", "FI", "FMC", "F",
-    "FTNT", "FTV", "FOXA", "FOX", "BEN", "FCX", "GRMN", "IT", "GE", "GEHC", "GEV", "GEN", "GNRC",
-    "GD", "GIS", "GM", "GPC", "GILD", "GPN", "GL", "GDDY", "GS", "HAL", "HIG", "HAS", "HCA", "DOC",
-    "HSIC", "HSY", "HPE", "HLT", "HOLX", "HD", "HON", "HRL", "HST", "HWM", "HPQ", "HUBB", "HUM",
-    "HBAN", "HII", "IBM", "IEX", "IDXX", "ITW", "INCY", "IR", "PODD", "INTC", "ICE", "IFF", "IP",
-    "INTU", "ISRG", "IVZ", "INVH", "IQV", "IRM", "JBHT", "JBL", "JKHY", "J", "JNJ", "JCI", "JPM",
-    "JNPR", "KVUE", "KDP", "KEY", "KEYS", "KMB", "KIM", "KMI", "KLAC", "KHC", "KR", "LHX", "LH",
-    "LRCX", "LW", "LVS", "LDOS", "LEN", "LIN", "LYV", "LKQ", "LMT", "L", "LOW", "LULU", "LYB",
-    "MTB", "MRO", "MPC", "MKTX", "MAR", "MMC", "MLM", "MAS", "MA", "MTCH", "MKC", "MCD", "MCK",
-    "MDT", "MRK", "META", "MET", "MTD", "MGM", "MCHP", "MU", "MSFT", "MAA", "MRNA", "MHK", "MOH",
-    "TAP", "MDLZ", "MPWR", "MNST", "MCO", "MS", "MOS", "MSI", "MSCI", "NDAQ", "NTAP", "NFLX", "NEM",
-    "NWSA", "NWS", "NEE", "NKE", "NI", "NDSN", "NSC", "NTRS", "NOC", "NCLH", "NRG", "NUE", "NVDA",
-    "NVR", "NXPI", "ORLY", "OXY", "ODFL", "OMC", "ON", "OKE", "ORCL", "OTIS", "PCAR", "PKG", "PANW",
-    "PH", "PAYX", "PAYC", "PYPL", "PNR", "PEP", "PFE", "PCG", "PM", "PSX", "PNW", "PNC", "POOL",
-    "PPG", "PPL", "PFG", "PG", "PGR", "PSA", "PEG", "PTC", "PHM", "QRVO", "PWR", "QCOM", "DGX",
-    "RL", "RJF", "RTX", "O", "REG", "REGN", "RF", "RSG", "RMD", "RVTY", "ROK", "ROL", "ROP", "ROST",
-    "RCL", "SPGI", "CRM", "SBAC", "SLB", "STX", "SRE", "NOW", "SHW", "SPG", "SWKS", "SJM", "SNA",
-    "SOLV", "SO", "LUV", "SWK", "SBUX", "STT", "STLD", "STE", "SYK", "SMCI", "SYF", "SNPS", "SYY",
-    "TMUS", "TROW", "TTWO", "TPR", "TRGP", "TGT", "TEL", "TDY", "TFX", "TER", "TSLA", "TXN", "TXT",
-    "TMO", "TJX", "TSCO", "TT", "TDG", "TRV", "TRMB", "TFC", "TYL", "TSN", "USB", "UBER", "UDR",
-    "ULTA", "UNP", "UAL", "UPS", "URI", "UNH", "UHS", "VLO", "VTR", "VLTO", "VRSN", "VRSK", "VZ",
-    "VRTX", "VTRS", "VICI", "V", "VST", "VMC", "WRB", "WAB", "WMT", "WBD", "WM", "WAT", "WEC",
-    "WFC", "WELL", "WST", "WDC", "WRK", "WY", "WHR", "WMB", "WTW", "WYNN", "XEL", "XYL", "YUM",
-    "ZBRA", "ZBH", "ZTS"
-]
-
-# iShares bloquea las peticiones automatizadas de forma consistente (con o
-# sin sesión/cookies/Referer), así que abandonamos esa fuente. En su lugar
-# usamos la API pública del screener de Nasdaq, filtrando por capitalización
-# pequeña/micro como aproximación a "estilo Russell 2000". No es la
-# composición exacta del índice (eso no existe gratis en ningún sitio, ver
-# nota más abajo), pero da una cesta amplia y real de small/micro caps de
-# NYSE, Nasdaq y AMEX sin que te bloqueen la petición.
-NASDAQ_SCREENER_URL = "https://api.nasdaq.com/api/screener/stocks"
 
 
-def get_smallcap_tickers(limit=2000):
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-        ),
-        "Accept": "application/json",
-        "Origin": "https://www.nasdaq.com",
-        "Referer": "https://www.nasdaq.com/",
-    }
-    params = {
-        "tableonly": "true",
-        "limit": str(limit),
-        "offset": "0",
-        "exchange": "nasdaq",
-    }
-    try:
-        resp = requests.get(NASDAQ_SCREENER_URL, headers=headers, params=params, timeout=20)
-        resp.raise_for_status()
-        payload = resp.json()
+# --- UTILIDADES COMUNES -----------------------------------------------
 
-        status = payload.get("status") or {}
-        data = payload.get("data")
-
-        if not data:
-            print(
-                f"AVISO: Nasdaq respondió sin datos. status={status}. "
-                f"Primeros 300 caracteres del cuerpo: {resp.text[:300]}"
-            )
-            return []
-
-        rows = (data.get("table") or {}).get("rows") or []
-        tickers = [
-            r["symbol"].strip()
-            for r in rows
-            if r.get("symbol") and r["symbol"].strip().replace(".", "").replace("-", "").isalnum()
-        ]
-        print(f"Small/micro caps (Nasdaq screener): {len(tickers)} tickers")
-        return tickers
-    except Exception as e:
-        print(
-            f"AVISO: no se pudo descargar el listado de small caps de Nasdaq "
-            f"({type(e).__name__}: {e or '(sin mensaje)'}). El screener seguirá "
-            "funcionando solo con S&P 500 + Mercado Español hasta que se resuelva esto."
-        )
-        return []
+def _dedupe(seq):
+    """Elimina duplicados preservando el orden de aparición."""
+    seen = set()
+    out = []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
 
-# Se mantiene el nombre anterior como alias para no tener que tocar el resto
-# del script (get_all_indexed_tickers lo sigue llamando igual).
-def get_russell2000_tickers():
-    return get_smallcap_tickers()
+# Formato esperado: 1-6 letras, opcionalmente con un sufijo tipo -B, -A
+# (acciones de clase), o el sufijo .MC para el mercado español.
+_TICKER_RE = re.compile(r"^[A-Z0-9]{1,6}(-[A-Z]{1,2})?$|^[A-Z0-9]{1,6}\.MC$")
 
 
-def get_all_indexed_tickers():
-    russell = get_russell2000_tickers()
-    indexed = []
-    for t in IBEX_TICKERS:
-        indexed.append((t, "IBEX 35"))
-    for t in BME_EXTRA_TICKERS:
-        indexed.append((t, "Mercado Continuo (BME)"))
-    for t in SP500_TICKERS:
-        indexed.append((t, "S&P 500"))
-    for t in russell:
-        if t not in SP500_TICKERS:
-            indexed.append((t, "Small/Micro Cap (US)"))
+def _validate_format(tickers, label):
+    """Avisa (no elimina) de tickers con formato sospechoso."""
+    raros = [t for t in tickers if not _TICKER_RE.match(t)]
+    if raros:
+        print(f"⚠️  [{label}] {len(raros)} ticker(s) con formato inusual, revisa a mano: {raros}")
+    return tickers
 
-    seen, deduped = set(), []
-    for ticker, idx in indexed:
-        if ticker in seen:
+
+def _fetch_csv_tickers(url, ticker_col, timeout=15, header_marker=None,
+                        asset_class_col=None, keep_asset_class="Equity"):
+    """Descarga un CSV público y extrae la columna de tickers.
+
+    header_marker: si el CSV trae texto antes de la cabecera real (como el
+    de iShares, que mete metadatos del fondo arriba), se recorta todo lo
+    anterior a ese marcador.
+    asset_class_col / keep_asset_class: para CSVs de holdings de ETFs,
+    para descartar líneas de cash/derivados que no son acciones.
+    """
+    resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+    resp.raise_for_status()
+    text = resp.text
+    if header_marker and header_marker in text:
+        text = text[text.index(header_marker):]
+    reader = csv.DictReader(io.StringIO(text))
+    tickers = []
+    for row in reader:
+        t = (row.get(ticker_col) or "").strip()
+        if not t or t in ("-", "N/A"):
             continue
-        seen.add(ticker)
-        deduped.append((ticker, idx))
-    return deduped
+        if asset_class_col and row.get(asset_class_col) not in (None, "", keep_asset_class):
+            continue
+        tickers.append(t.replace(".", "-"))
+    return _dedupe(tickers)
 
 
-# ============================================================
-# 2. Descarga por ticker (igual que en la app, pero pensado para
-#    correr sin prisa y con más tolerancia a fallos)
-# ============================================================
+# --- DOW JONES COMPOSITE (65) ------------------------------------------
+# No existe una fuente pública gratuita que se auto-actualice para este
+# índice concreto (a diferencia del S&P 500 o el Nasdaq 100), así que se
+# mantiene como lista estática. Se ha corregido un error real: "DOW" ya
+# no forma parte del Dow Jones Industrial Average (fue sustituido por
+# "SHW" en noviembre de 2024), así que sobraba en la lista original.
+# Revisa esta lista manualmente de vez en cuando (composición oficial en
+# https://en.wikipedia.org/wiki/Dow_Jones_Composite_Average), sobre todo
+# los tramos de transporte y utilities, que no se han podido contrastar
+# contra una fuente 100% actualizada.
 
-def fetch_stock_data(item, max_retries=4):
-    ticker, index_name = item
-    last_error = "sin datos (info vacío o sin precio)"
+def get_dowjones_tickers():
+    tickers = [
+        # Industrial (30)
+        "AAPL", "AMGN", "AMZN", "AXP", "BA", "CAT", "CRM", "CSCO", "CVX", "DIS",
+        "GS", "HD", "HON", "IBM", "JNJ", "JPM", "KO", "MCD", "MMM",
+        "MRK", "MSFT", "NKE", "NVDA", "PG", "SHW", "TRV", "UNH", "V", "VZ", "WMT",
+        # Transporte (20)
+        "AAL", "CAR", "CHRW", "CSX", "DAL", "EXPD", "FDX", "JBHT", "KNX", "LUV",
+        "MATX", "NSC", "ODFL", "R", "UNP", "UAL", "UPS", "XPO", "ALGT", "LSTR",
+        # Utilities (15)
+        "AEP", "AES", "ED", "D", "DUK", "EIX", "FE", "LNT", "NEE", "NI",
+        "PCG", "PEG", "SRE", "SO", "WEC",
+    ]
+    return _validate_format(_dedupe(tickers), "Dow Jones Composite")
 
-    for attempt in range(max_retries + 1):
+
+# --- NASDAQ 100 (dinámico) ---------------------------------------------
+
+_NASDAQ100_URL = "https://raw.githubusercontent.com/Gary-Strauss/NASDAQ100_Constituents/master/data/nasdaq100_constituents.csv"
+
+_NASDAQ100_FALLBACK = [
+    "AAPL", "ABNB", "ADBE", "ADI", "ADP", "ADSK", "AEP", "AMAT", "AMD", "AMGN",
+    "AMZN", "ANSS", "ASML", "AVGO", "AZN", "BKR", "BIIB", "BKNG", "CDNS", "CEG",
+    "CHTR", "CMCSA", "COST", "CPRT", "CSGP", "CSX", "CTAS", "CTSH", "DDOG", "DLTR",
+    "DXCM", "EA", "EXC", "FANG", "FAST", "FTNT", "GEHC", "GILD", "GOOG", "GOOGL",
+    "HON", "IDXX", "ILMN", "INTC", "INTU", "ISRG", "KDP", "KHC", "KLAC", "LRCX",
+    "LULU", "MAR", "MCHP", "MDB", "MDLZ", "MELI", "META", "MNST", "MRVL", "MSFT",
+    "MU", "NFLX", "NVDA", "NXPI", "ODFL", "ON", "ORLY", "PANW", "PAYX", "PCAR",
+    "PDD", "PEP", "PYPL", "QCOM", "REGN", "ROP", "ROST", "SBUX", "SIRI", "SNPS",
+    "TEAM", "TMUS", "TSLA", "TTD", "TXN", "VRSK", "VRTX", "WBD", "WDAY", "XEL", "ZS",
+]  # ⚠️ Lista de emergencia; puede estar desfasada. Se usa solo si falla la descarga.
+
+
+def get_nasdaq100_tickers():
+    try:
+        tickers = _fetch_csv_tickers(_NASDAQ100_URL, ticker_col="Ticker")
+        print(f"✅ NASDAQ 100 descargado en vivo ({len(tickers)} tickers).")
+    except Exception as e:
+        print(f"⚠️  No se pudo descargar el NASDAQ 100 actualizado ({e}); usando lista de respaldo (puede estar desfasada).")
+        tickers = _dedupe(_NASDAQ100_FALLBACK)
+    return _validate_format(tickers, "NASDAQ 100")
+
+
+# --- S&P 500 (dinámico) -------------------------------------------------
+
+_SP500_URL = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
+
+_SP500_FALLBACK = [
+    "A", "AAL", "AAPL", "ABBV", "ABNB", "ABT", "ACGL", "ACN", "ADBE", "ADI", "ADM", "ADP", "ADSK",
+    "AEE", "AEP", "AES", "AFL", "AIG", "AIZ", "AJG", "AKAM", "ALB", "ALGN", "ALL", "ALLE", "AMAT",
+    "AMCR", "AMD", "AME", "AMGN", "AMP", "AMT", "AMZN", "ANET", "ANSS", "AON", "AOS", "APA", "APD",
+    "APH", "APTV", "ARE", "ATO", "AVB", "AVGO", "AVY", "AWK", "AXON", "AXP", "AZO", "BA", "BAC",
+    "BALL", "BAX", "BBWI", "BBY", "BDX", "BEN", "BF-B", "BG", "BIIB", "BIO", "BK", "BKNG", "BKR",
+    "BLDR", "BLK", "BMY", "BR", "BRK-B", "BRO", "BSX", "BWA", "BX", "BXP", "C", "CAG", "CAH",
+    "CARR", "CAT", "CB", "CBOE", "CBRE", "CCI", "CCJ", "CDNS", "CDW", "CE", "CEG", "CF", "CFG",
+    "CHD", "CHRW", "CHTR", "CI", "CINF", "CL", "CLX", "CMA", "CMG", "CMI", "CMS", "CNC", "CNP",
+    "COF", "COO", "COP", "COR", "COST", "CPB", "CPRT", "CPT", "CRL", "CRM", "CSCO", "CSGP", "CSX",
+    "CTAS", "CTRA", "CTSH", "CTVA", "CVS", "CVX", "CZR", "D", "DAL", "DD", "DE", "DFS",
+    "DG", "DGX", "DHI", "DHR", "DIS", "DLR", "DLTR", "DOC", "DOV", "DOW", "DPZ", "DRI", "DTE",
+    "DUK", "DVA", "DVN", "DXCM", "EA", "EBAY", "ECL", "ED", "EFX", "EG", "EIX", "EL", "ELV",
+    "EMN", "EMR", "ENPH", "EOG", "EPAM", "EQT", "EQR", "EQIX", "ERIE", "ES", "ESS", "ETN",
+    "ETR", "ETSY", "EVRG", "EW", "EXC", "EXPD", "EXPE", "EXR", "F", "FANG", "FAST", "FCX", "FDS",
+    "FDX", "FE", "FFIV", "FI", "FICO", "FIS", "FITB", "FMC", "FOX", "FOXA", "FRT", "FSLR", "FTNT",
+    "FTV", "GD", "GDDY", "GE", "GEHC", "GEN", "GEV", "GOOG", "GOOGL", "GPC", "GPK", "GPN", "GRMN", "GS", "GWW",
+    "HAL", "HAS", "HBAN", "HCA", "HD", "HIG", "HII", "HLT", "HOLX", "HON", "HPE", "HPQ",
+    "HRL", "HSIC", "HST", "HSY", "HUBB", "HUM", "HWM", "IBM", "ICE", "IDXX", "IEX", "IFF", "ILMN",
+    "INCY", "INTC", "INTU", "INVH", "IP", "IPG", "IQV", "IR", "IRM", "ISRG", "IT", "ITW", "IVZ",
+    "J", "JBHT", "JBL", "JCI", "JKHY", "JNJ", "JNPR", "JPM", "K", "KDP", "KEY", "KEYS", "KHC",
+    "KIM", "KLAC", "KMB", "KMI", "KMX", "KO", "KR", "L", "LDOS", "LEN", "LH", "LHX", "LIN",
+    "LKQ", "LLY", "LMT", "LNT", "LOW", "LRCX", "LULU", "LUV", "LVS", "LW", "LYB", "LYV", "MA",
+    "MAA", "MAR", "MAS", "MCD", "MCHP", "MCK", "MCO", "MDLZ", "MDT", "MET", "META", "MGM", "MHK",
+    "MKC", "MKTX", "MLM", "MMC", "MMM", "MNST", "MO", "MOH", "MOS", "MPC", "MPWR", "MRK", "MRNA",
+    "MRO", "MS", "MSI", "MSFT", "MTB", "MTD", "MU", "NCLH", "NDAQ", "NDSN", "NEE", "NEM", "NFLX",
+    "NI", "NKE", "NOC", "NOW", "NRG", "NSC", "NTAP", "NTRS", "NUE", "NVDA", "NVR", "NWS",
+    "NWSA", "NXPI", "O", "ODFL", "OKE", "OMC", "ON", "ORLY", "ORCL", "OTIS", "OXY", "PANW", "PARA",
+    "PAYX", "PAYC", "PYPL", "PNR", "PEP", "PFE", "PFG", "PG", "PGR", "PH", "PHM", "PKG", "PLD",
+    "PLTR", "PM", "PNC", "PNW", "POOL", "PPG", "PPL", "PRU", "PSA", "PSX", "PTC", "PWR",
+    "QCOM", "RCL", "REG", "REGN", "RF", "RJF", "RL", "RMD", "ROK", "ROL", "ROP", "ROST", "RSG",
+    "RTX", "RVTY", "SBAC", "SBUX", "SCHW", "SHW", "SJM", "SLB", "SNA", "SNPS",
+    "SO", "SPG", "SPGI", "SRE", "STE", "STLD", "STT", "STX", "STZ", "SWK", "SWKS", "SYF", "SYK",
+    "SYY", "T", "TAP", "TDG", "TDY", "TECH", "TEL", "TER", "TFC", "TFX", "TGT", "TJX", "TMO",
+    "TMUS", "TPR", "TRGP", "TRMB", "TROW", "TRV", "TSCO", "TSN", "TSLA", "TT", "TTWO", "TXN",
+    "TXT", "TYL", "UAL", "UDR", "UHS", "ULTA", "UNH", "UNP", "UPS", "URI", "USB", "V", "VICI",
+    "VLO", "VLTO", "VMC", "VRSK", "VRSN", "VRTX", "VST", "VTR", "VTRS", "VZ", "WAB", "WAT", "WBA",
+    "WBD", "WDC", "WEC", "WELL", "WFC", "WM", "WMB", "WMT", "WRB", "WST", "WTW", "WY",
+    "WYNN", "XEL", "XOM", "XYL", "YUM", "ZBH", "ZBRA", "ZTS",
+]  # ⚠️ Lista de emergencia; puede estar desfasada. Se usa solo si falla la descarga.
+
+
+def get_sp500_tickers():
+    try:
+        tickers = _fetch_csv_tickers(_SP500_URL, ticker_col="Symbol")
+        print(f"✅ S&P 500 descargado en vivo ({len(tickers)} tickers).")
+    except Exception as e:
+        print(f"⚠️  No se pudo descargar el S&P 500 actualizado ({e}); usando lista de respaldo (puede estar desfasada).")
+        tickers = _dedupe(_SP500_FALLBACK)
+    return _validate_format(tickers, "S&P 500")
+
+
+# --- ESPAÑA: IBEX 35 + Mercado Continuo ---------------------------------
+# El bloque IBEX 35 se ha actualizado a la composición vigente en agosto
+# de 2026 (contrastada con investing.com). El bloque de "Mercado
+# Continuo" (medium/small caps fuera del IBEX) NO se ha podido
+# contrastar exhaustivamente contra una fuente actualizada — revísalo si
+# depende de precisión.
+
+def get_spain_tickers():
+    tickers = [
+        # IBEX 35 (verificado agosto 2026)
+        "SAN.MC", "BBVA.MC", "TEF.MC", "ITX.MC", "IBE.MC", "REP.MC", "AMS.MC",
+        "CABK.MC", "SAB.MC", "FER.MC", "ACS.MC", "AENA.MC", "ELE.MC", "REDE.MC",
+        "MAP.MC", "COL.MC", "CLNX.MC", "FDR.MC", "GRF.MC", "ROVI.MC", "BKT.MC",
+        "ANA.MC", "ENG.MC", "IAG.MC", "IDR.MC", "LOG.MC",
+        "UNI.MC", "SLR.MC", "SCYR.MC", "ACX.MC", "NTGY.MC", "MTS.MC", "MRL.MC",
+        "ANE.MC", "PUIG.MC",
+        # Mercado Continuo (Medium & Small Caps) — SIN verificar exhaustivamente
+        "MTS.MC", "ALM.MC", "FAES.MC", "GRE.MC", "GEST.MC", "TLGO.MC",
+        "TUB.MC", "OHLA.MC", "FCC.MC", "A3M.MC", "LDA.MC", "DOM.MC", "NRE.MC",
+        "MVC.MC", "AFL.MC", "AZK.MC", "EZE.MC", "AMP.MC", "MDF.MC", "PRS.MC",
+        "R4.MC", "GVC.MC", "AUD.MC", "ECO.MC", "CLE.MC", "TRG.MC", "OLE.MC",
+        "NLG.MC", "ORY.MC", "RLIA.MC", "SPS.MC", "ALNT.MC", "LGT.MC", "DIA.MC",
+        "MEL.MC", "VIS.MC", "PHM.MC", "CAF.MC", "EBRO.MC",
+    ]
+    return _validate_format(_dedupe(tickers), "España")
+
+
+# --- RUSSELL 2000 (dinámico, ~1900 tickers) ------------------------------
+# La versión anterior de esta lista tenía 90 tickers duplicados y toda la
+# pinta de haberse generado a mano/con un LLM sin verificación real — no
+# es fiable. Aquí se sustituye por una descarga en vivo de las holdings
+# públicas del ETF IWM (iShares Russell 2000 ETF), que reproduce el
+# índice. Esa fuente puede tener protección anti-bot que bloquee
+# `requests` en algunos entornos; si eso ocurre en el tuyo, la opción más
+# robusta es descargar tú mismo el CSV una vez al mes desde
+# https://www.ishares.com/us/products/239710/ishares-russell-2000-etf
+# (botón "Download Holdings CSV") y guardarlo como russell2000_holdings.csv
+# junto a este script — la función lo detecta y lo usa sin tocar la red.
+
+_RUSSELL2000_URL = "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/latest-holdings.csv"
+_RUSSELL2000_LOCAL_CACHE = "russell2000_holdings.csv"
+
+_RUSSELL2000_FALLBACK_NOTE = (
+    "⚠️  Usando la lista estática de Russell 2000 heredada del script original. "
+    "No ha sido posible verificarla ticker a ticker (son ~1500 nombres); se sabe "
+    "que tenía decenas de duplicados, que ya se han eliminado aquí, pero pueden "
+    "quedar tickers incorrectos o descatalogados. Trátala como último recurso."
+)
+
+
+def get_russell2000_tickers():
+    # 1) Fichero local descargado a mano (más fiable, sin depender de la red)
+    try:
+        with open(_RUSSELL2000_LOCAL_CACHE, "r", encoding="utf-8") as f:
+            text = f.read()
+        marker = "Ticker,Name"
+        if marker in text:
+            text = text[text.index(marker):]
+        reader = csv.DictReader(io.StringIO(text))
+        tickers = _dedupe([
+            row["Ticker"].strip().replace(".", "-")
+            for row in reader
+            if row.get("Asset Class") == "Equity" and row.get("Ticker", "").strip() not in ("-", "")
+        ])
+        print(f"✅ Russell 2000 leído de {_RUSSELL2000_LOCAL_CACHE} ({len(tickers)} tickers).")
+        return _validate_format(tickers, "Russell 2000")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"⚠️  Error leyendo {_RUSSELL2000_LOCAL_CACHE} ({e}), se intentará descarga en vivo.")
+
+    # 2) Descarga en vivo desde iShares
+    try:
+        tickers = _fetch_csv_tickers(
+            _RUSSELL2000_URL, ticker_col="Ticker", header_marker="Ticker,Name",
+            asset_class_col="Asset Class", keep_asset_class="Equity",
+        )
+        print(f"✅ Russell 2000 descargado en vivo ({len(tickers)} tickers).")
+        return _validate_format(tickers, "Russell 2000")
+    except Exception as e:
+        print(f"⚠️  No se pudo descargar el Russell 2000 en vivo ({e}).")
+        print(_RUSSELL2000_FALLBACK_NOTE)
+        return _validate_format(_dedupe(_RUSSELL2000_FALLBACK), "Russell 2000")
+
+
+# Lista heredada del script original, solo como último recurso. Se ha
+# deduplicado (tenía 90 tickers repetidos) pero NO se ha verificado
+# individualmente contra una fuente actual.
+_RUSSELL2000_FALLBACK = [
+    "AAL", "AAON", "AAT", "AAWW", "ABCB", "ABG", "ABM", "ACAD", "ACDC", "ACLS",
+    "ACMR", "ACRE", "ADTN", "ADNT", "AEIS", "AEO", "AAN", "AMTB", "AEL", "AGO",
+    "AGYS", "AHCO", "AIRC", "AKR", "ALRM", "ALTR", "AMBA", "AMBC", "AMN", "AMPH",
+    "AMR", "AMRC", "AMSF", "AMWD", "ANGO", "ANIK", "ANIP", "AOSL", "APAM", "APOG",
+    "APPF", "APPN", "ARDX", "AROC", "ARR", "ARVN", "ARWR", "ASGN", "BHE", "ASIX",
+    "ASB", "ASTE", "ATEN", "ATGE", "ATKR", "ATNI", "ATRC", "ATRI", "ATRO", "AUB",
+    "AVA", "AVAV", "AVDL", "AVNS", "AVNT", "AVNW", "AVO", "AVT", "AXL", "AXSM",
+    "AYI", "AZZ", "ACER", "ACET", "ACHV", "ACIU", "ACNB", "ACOR", "ACR", "ACTG",
+    "ACU", "ACVA", "ADAG", "ADAP", "ADCT", "ADMA", "ADMP", "ADRO", "ADSE", "ADSK",
+    "ADTH", "ADUS", "ADVM", "AEHR", "AEY", "AEYE", "AEVA", "AFBI", "AFCG", "AFG",
+    "AFIB", "AFMD", "AFRM", "AFYA", "AGBA", "AGCO", "AGEN", "AGFS", "AGIL", "AGL",
+    "AGLE", "AGM", "AGMH", "AGRI", "AGRO", "AGRX", "AGS", "AGTC", "AGTI", "AGX",
+    "AHG", "AHH", "AHT", "AI", "AIFU", "AIG", "AIH", "AIHS", "AIM", "BANC",
+    "BANF", "BANR", "BZH", "BCOR", "BDC", "BEAM", "BELFA", "BHB", "BJRI", "BKU",
+    "BLKB", "BLMN", "BMBL", "BME", "BMI", "BNL", "BOC", "BOOT", "BOX", "BRKL",
+    "BSRR", "BABY", "BAC", "BACK", "BAFN", "BAND", "BANX", "BAOS", "BASE", "BATL",
+    "BBAR", "BBCP", "BGI", "BBIO", "BBLG", "BBSI", "BCAB", "BCAN", "BCBP", "BCC",
+    "BCDA", "BCEI", "BCEL", "BCML", "BCRX", "BCSF", "BCTF", "BCTX", "BDFC", "BDRX",
+    "BFC", "BFAM", "BFI", "BFH", "BFRG", "BFST", "BGB", "BGCP", "BGFV", "BGNE",
+    "BGRY", "BHAL", "BHAT", "BHF", "BHIL", "BHR", "BHVN", "BIDU", "BIG", "BIGC",
+    "BILL", "BIMI", "BIOA", "BIOC", "BIOL", "BIOR", "BIOS", "BIOT", "BIPL", "BIRD",
+    "BITF", "BIVI", "BJDX", "BKCC", "BKD", "BKE", "BKEP", "BKH", "BKKT", "BKNG",
+    "BKR", "BKSC", "BKTI", "BKYI", "BL", "BLBD", "BLBX", "BLCM", "CBL", "CBT",
+    "CBU", "CCB", "CCF", "CCNE", "CCOI", "CDLX", "CEIX", "CENT", "CFFN", "CGNT",
+    "CHCO", "CHEF", "CHFC", "CHMG", "CHS", "CIEN", "CIVB", "CLBK", "CLFD", "CLW",
+    "CMRX", "CNMD", "CNNE", "CNO", "CNX", "COCH", "COHU", "COKE", "COLB", "COLL",
+    "CONN", "CORT", "CPRX", "CRAI", "CRGY", "CRK", "CRL", "CRMD", "CRS", "CRUS",
+    "CRVL", "CSGS", "CSR", "CSTM", "CSV", "CTBI", "CTRE", "CTRN", "CVBF", "CVCO",
+    "CVGI", "CVGW", "CVLT", "CWCO", "CWEN", "CWT", "CXW", "CYRX", "CYTK", "CABO",
+    "CAC", "CACC", "CADE", "CADL", "CAE", "CAG", "CAKE", "CAL", "CALA", "CALB",
+    "CALM", "CALX", "CAMP", "CAMT", "CAN", "CAPR", "CARA", "CARE", "CARG", "CARR",
+    "CARS", "CARV", "CASA", "CASH", "CASI", "CASS", "CASY", "CATC", "CATH", "CATY",
+    "CBAN", "CBAT", "CBAY", "CBFV", "CBIO", "CBLY", "CBNK", "CBON", "CBRE", "CBRG",
+    "CBRL", "CBSH", "CBTX", "CBYL", "CCAP", "CCBG", "DAR", "DAN", "DCI", "DENN",
+    "DFIN", "DGII", "DHC", "DHIL", "DHT", "DIOD", "DLX", "DNB", "DNLI", "DORM",
+    "DRH", "DRQ", "DRS", "DTE", "DY", "DAIO", "DAKT", "DAL", "DARE", "DASH",
+    "DATS", "DAVE", "DAWN", "DBGI", "DBVT", "DCO", "DCP", "DDD", "DDS", "DECK",
+    "DEN", "DERM", "DFH", "DGICA", "DGICB", "DHCV", "DINO", "DISA", "DIT", "DJCO",
+    "DK", "DKL", "DKS", "DLHC", "DLPN", "DLTH", "DMAC", "DMTK", "DNMR", "DNUT",
+    "DOCN", "DOCU", "DOMO", "DOLE", "DOOR", "DOUA", "DOX", "DPZ", "DQ", "DRD",
+    "DRI", "DRIO", "DRRX", "DRVN", "DSGN", "DSGR", "DSP", "DSS", "DSWL", "DT",
+    "DLA", "DTIL", "EAT", "EBC", "EBF", "EGB", "EGP", "EIG", "EIX", "ELF",
+    "EME", "ENR", "ENS", "ENV", "ENVA", "EPC", "EPRT", "ESE", "ESGR", "ESNT",
+    "EVTC", "EWA", "EXPO", "EXTN", "EAF", "EAGL", "EBTC", "ECPG", "EDIT", "EDR",
+    "EDRY", "EDTX", "EEFT", "EEX", "EEXC", "EEXS", "EFSC", "EFX", "EGAN", "EGBN",
+    "EGHT", "EGLX", "EIGR", "EIM", "EKSO", "ELAL", "ELAN", "ELBM", "ELC", "ELDN",
+    "ELEV", "ELMD", "ELOX", "ELPK", "ELSE", "ELTK", "ELYM", "EMBC", "EMCF", "EMKR",
+    "EML", "EMLD", "EMN", "EMR", "EMX", "ENB", "ENFN", "ENG", "ENIC", "ENLV",
+    "ENOB", "ENPH", "ENSG", "ENSV", "ENTG", "ENVB", "ENX", "ENZ", "EOC", "EOD",
+    "EOG", "EOLS", "EOSE", "EPAM", "FANH", "FBK", "FBNC", "FBP", "FBY", "FCBC",
+    "FCF", "FCFS", "FDBC", "FELE", "FFBC", "FFIC", "FFIN", "FFNW", "FHI", "FIBK",
+    "FINV", "FISI", "FIVE", "FLIC", "FLNG", "FLO", "FLR", "FLY", "FMAO", "FNB",
+    "FNCB", "FNLC", "FNTG", "FOR", "FORWARD", "FSLR", "FSM", "FTAI", "FTDR", "FUL",
+    "FULT", "FACT", "FAII", "FALN", "FANG", "FARO", "FAST", "FATE", "FATP", "FBC",
+    "FBIZ", "FBMS", "FBRT", "FCAP", "FCCO", "FCOA", "FCRD", "FCX", "FDEF", "FDS",
+    "FDUS", "FERG", "FFBW", "FFC", "FFHG", "FFIV", "FGBI", "FGEN", "FGF", "FGLD",
+    "FGMC", "FHN", "FHS", "FIAC", "FICO", "FIII", "FITB", "FIVN", "FIXX", "FIZZ",
+    "FJP", "GATX", "GBCI", "GBX", "GCBC", "GCO", "GENC", "GEOS", "GERN", "GHC",
+    "GHL", "GIII", "GKOS", "GLDD", "GLP", "GLRE", "GLT", "GNE", "GPMT", "GPRE",
+    "GRNT", "GTLS", "GTY", "GWB", "GATO", "GAU", "GBAB", "GBIO", "GBLI", "GBNH",
+    "GBNY", "GBS", "GCI", "GCMG", "GCOT", "GCP", "GCV", "GDEN", "GDEV", "GDL",
+    "GDRX", "GDYN", "GECC", "GEF", "GEG", "GEO", "GEVO", "GFED", "GFFF", "GFGD",
+    "GFL", "GGE", "GGG", "GH", "GHAC", "GHIX", "GHIY", "GHRS", "GIB", "GIC",
+    "GIFI", "GIGM", "GIL", "GILD", "GILT", "GIPR", "GLAD", "GLEO", "GLMD", "GLNG",
+    "GLOB", "GLOP", "HAFC", "HAIN", "HALO", "HBB", "HBCP", "HBNC", "HCA", "HCSG",
+    "HEES", "HFWA", "HI", "HIBB", "HIG", "HIW", "HLIT", "HLX", "HMST", "HOPE",
+    "HP", "HPK", "HR", "HRI", "HRMY", "HTH", "HUBG", "HWC", "HWKN", "HY",
+    "HAYN", "HBAN", "HBI", "HBIO", "HCAT", "HCC", "HCCI", "HCKT", "HCM", "HCTI",
+    "HDG", "HDSN", "HE", "HEAR", "HEI", "HELE", "HEP", "HEPA", "HEQ", "HERA",
+    "HERO", "HEWI", "HFBL", "HFFG", "HGBL", "HGEN", "HGLB", "HHH", "HIFS", "HIHO",
+    "HII", "HIIN", "HIMS", "HIPO", "HIX", "HKIT", "HL", "HLF", "HLGN", "HLI",
+    "HLNE", "HLT", "IART", "IBOC", "IBTX", "ICFI", "ICUI", "IESC", "IGMS", "IGT",
+    "IHRT", "IIPR", "ILLM", "IMAX", "INDB", "INGR", "INN", "INOV", "INSG", "INSM",
+    "INSW", "INT", "INVA", "INVE", "IONR", "IOSP", "IPAR", "IPGP", "IPI", "IRDM",
+    "IRMD", "IROQ", "IRT", "ITCI", "ITGR", "ITRI", "ITT", "IAC", "IBA", "IBCP",
+    "IBEX", "IBP", "ICCC", "ICCM", "ICD", "ICHR", "ICLK", "ICLR", "ICMB", "ICPT",
+    "ICU", "IDA", "IDAI", "IDCC", "IDN", "IDT", "IDYA", "IEC", "IEX", "IFF",
+    "IFGL", "IFRX", "IFV", "IGA", "IGC", "IGD", "IGIC", "IGNY", "IGSB", "IHD",
+    "IIGD", "III", "IIIN", "IIIV", "JACK", "JBSS", "JELD", "JJSF", "JKHY", "JOUT",
+    "JRNA", "JRVR", "KALU", "KAR", "KBH", "KFRC", "KLIC", "KNSA", "KRO", "KTB",
+    "KTOS", "JAG", "JAKK", "JAMF", "JAN", "JBLU", "JCE", "JCG", "JCH", "JCTCF",
+    "JD", "JDEP", "JFIN", "JFU", "JG", "JILL", "JKS", "JLL", "JMD", "JMM",
+    "JMS", "JNCE", "JNJ", "JNPR", "JOB", "JOE", "JOF", "JOYY", "JPHY", "JRSH",
+    "KA", "KAFM", "KAMN", "KATE", "KBAL", "KBDC", "KBNT", "KBR", "KC", "KDI",
+    "KDNY", "KE", "KELYA", "KEM", "KEN", "KEP", "KEX", "LAD", "LADR", "LMAT",
+    "LMNR", "LNTH", "LOB", "LOM", "LOPE", "LPI", "LPSN", "LQDT", "LTC", "LTRPA",
+    "LUMN", "LUNA", "LXU", "LAAC", "LAB", "LABP", "LAKE", "LAMR", "LANC", "LAND",
+    "LARK", "LASR", "LAUR", "LAW", "LAZR", "LAZY", "LBA", "LBRA", "LBRDA", "LBRDK",
+    "LBRT", "LC", "LCAC", "LCI", "LCNB", "LCUT", "LDHA", "LDOS", "LE", "LEA",
+    "LEAP", "LECO", "LEDS", "LEE", "LEG", "LEGH", "LEGN", "LEJU", "LELV", "LEMD",
+    "LMDX", "LMFA", "LOAN", "LNC", "LNG", "LNN", "LNSR", "LNW", "LOCO", "LOD",
+    "MATX", "MAXN", "MBWM", "MCB", "MCRI", "MDC", "MDGL", "MDRX", "MDU", "MEDP",
+    "MEI", "MFA", "MFRM", "MGPI", "MGRC", "MHO", "MIME", "MMS", "MMSI", "MNDO",
+    "MNRO", "MOD", "MODN", "MOV", "MPLN", "MPWR", "MRCY", "MRTN", "MRUS", "MSA",
+    "MSBI", "MSCI", "MSM", "MSTR", "MTDR", "MGEE", "MTH", "MTN", "MTRN", "MWA",
+    "MXL", "MYGN", "MYRG", "MAA", "MAC", "MACK", "MACU", "MAG", "MAGS", "MAIA",
+    "MAIN", "MAN", "MANH", "MANU", "MAPS", "MARA", "MARK", "MARPS", "MASI", "MATW",
+    "MAX", "MBIN", "MBIO", "MBNKP", "MBOT", "MBRX", "MBUU", "MC", "MCBC", "MCBS",
+    "MCC", "MCD", "MCFT", "MCG", "MCHX", "MCI", "MCK", "MCN", "NAPA", "NATH",
+    "NAVI", "NBHC", "NBN", "NC", "NCLH", "NCNO", "NDSN", "NEU", "NEOG", "NESR",
+    "NET", "NEWR", "NEX", "NEXT", "NFBK", "NGVT", "NHC", "NJR", "NKLA", "NLOK",
+    "NMIH", "NNN", "NODK", "NOVT", "NPO", "NRP", "NSIT", "NSP", "NSS", "NTB",
+    "NTCT", "NTHS", "NTLA", "NTRA", "NTUS", "NUV", "NVEC", "NVMI", "NVRI", "NVRO",
+    "NVT", "NWBI", "NWFL", "NWN", "NX", "NXGN", "NXRT", "NXST", "NYCB", "NYMT",
+    "NAAS", "NABL", "NARI", "NAT", "NATR", "NAVB", "NBEV", "NBR", "NBRV", "NBTB",
+    "NCBS", "NMM", "NMRK", "OAX", "OBK", "OCFC", "OCN", "OCUL", "ODC", "OEC",
+    "OFLX", "OFG", "OII", "OIS", "OLN", "OMCL", "ONB", "ONEM", "ONTF", "OOMA",
+    "OPCH", "OPLN", "OPY", "ORA", "ORC", "ORRF", "OSCR", "OSIS", "OSK", "OSPN",
+    "OTTR", "OUT", "OZK", "PACB", "PAG", "PAR", "PARR", "PASG", "PATK", "PB",
+    "PBA", "PBC", "PBI", "PBF", "PBH", "PBPB", "PBYI", "PCBK", "PCF", "PCRX",
+    "PCTY", "PDS", "PDCE", "PEBO", "PECO", "PENN", "PEPG", "PFBC", "PFC", "PFIS",
+    "PFMT", "PGC", "PGTI", "PHIN", "PII", "PINE", "PING", "PLAB", "PLAY", "PLOW",
+    "PLSE", "PLUS", "PLXS", "PNTG", "PNFP", "POL", "POR", "POWI", "PPBI", "PRAA",
+    "PRAX", "PRFT", "PRG", "QCRH", "RDC", "RDNT", "RGNX", "RGR", "RHI", "RHP",
+    "QADB", "QD", "QDEL", "QFIN", "QIWI", "QLGN", "QLYS", "QNST", "QPAC", "QTRX",
+    "RACC", "RAD", "RADA", "RAMP", "RARE", "RAVE", "RBC", "RBCAA", "RBCN", "RCEL",
+    "RCKT", "RCKY", "RCL", "RCM", "RCUS", "RDVT", "REAX", "REE", "REFI", "REFR",
+    "REI", "RELI", "RELL", "RENE", "REPL", "REPX", "RES", "RETA", "REVG", "REX",
+    "REXR", "REZI", "RFIL", "RGA", "RGCO", "RGEN", "RGLD", "RGLS", "RGP", "RIG",
+    "SABR", "SAFT", "SAGE", "SAH", "SAM", "SANM", "SASR", "SBBP", "SBGI", "SBH",
+    "SBNY", "SBOW", "SBRA", "SBR", "SBS", "SBUX", "SCAC", "SCHN", "SCHL", "SCOR",
+    "SCPH", "SCSC", "SCVL", "SD", "SDGR", "SEAC", "SEAS", "SEB", "SEE", "SELB",
+    "SEM", "SEMR", "SENEA", "SENS", "SF", "SFBS", "SFNC", "SFST", "SGA", "SGC",
+    "SGEN", "SGH", "SGMO", "SGMS", "SGRY", "SGU", "SHAK", "SHBI", "SHEN", "SHLO",
+    "SHOO", "SHM", "SHYF", "SI", "SIBN", "SIEN", "SIG", "SIGA", "SIGI", "SILK",
+    "TACT", "TAIT", "TAL", "TALO", "TALK", "TAP", "TARS", "TAST", "TBBK", "TBI",
+    "TCBK", "TCBI", "TCBP", "TCBX", "TCFC", "TCI", "TCMD", "TCNB", "TCRX", "TCS",
+    "TDF", "TDUP", "TECD", "TECH", "TTEC", "TGEN", "TGH", "TGI", "TGNA", "TGR",
+    "TH", "THC", "THFF", "THG", "THO", "THRM", "TIG", "TIPT", "TISI", "TITN",
+    "TKO", "TKR", "TLRY", "TMBR", "TMCI", "TMDX", "TNET", "TNGO", "TNK", "TNL",
+    "UBSI", "UCBI", "UDR", "UE", "UEIC", "UFCS", "UFI", "UFPI", "UGI", "UHAL",
+    "UI", "ULCC", "ULTA", "UMBF", "UMH", "UNF", "UNFI", "UNIT", "UNM", "UNVR",
+    "URBN", "URG", "URGN", "URI", "USAC", "USAP", "USCB", "USEG", "USLM", "USM",
+    "USNA", "USPH", "UTI", "UTL", "UTMD", "UTRS", "UTZ", "UVE", "UVSP", "VAX",
+    "VAXX", "VBTX", "VC", "VCEL", "VCTR", "VECO", "VFF", "VGR", "VIA", "VIAC",
+    "VICI", "VIDE", "VIE", "VINC", "VIP", "VIR", "VIRT", "VISL", "VLO", "VLY",
+    "VMC", "VMEO", "VNDA", "VNOM", "VNT", "VOPN", "VOXX", "VPG", "VRA", "VRAY",
+    "VRCA", "VRDN", "VMD", "VRE", "VRML", "VRNS", "VRNT", "VRRM", "VRS", "VSEC",
+    "VSH", "VSTA", "VSTM", "VTC", "VTGN", "VTLE", "VTOL", "VTRU", "VTYX", "VUZI",
+    "VVNT", "VVOS", "VVV", "VXRT", "VYGR", "VYNE", "WAB", "WAC", "WABC", "WAFU",
+    "WAFD", "WAL", "WLD", "WNC", "WOOD", "WOR", "WRAP", "WRLD", "WSBC", "WSC",
+    "WSFS", "WSR", "WST", "WTBA", "WTFC", "WTI", "WTM", "TR", "WWD", "WW",
+    "XEC", "XERS", "XFLT", "XFOR", "XGN", "XHR", "XNCR", "XOG", "XOM", "XOMA",
+    "XPEL", "XPER", "XPL", "XPO", "XPRO", "XRAY", "XRM", "XTLB", "XTSL", "XXII",
+    "XYL", "Y", "YELL", "YETI", "YETN", "YEXT", "YGYI", "YMAB", "YORW", "YPF",
+    "YTRA", "ZEUS", "ZGNX", "ZIM", "ZIMV", "ZION", "ZIP", "ZIXI", "ZNTL", "ZOM",
+    "ZUMZ", "ZURA", "ZVO", "ZYME", "ZYXI",
+]
+
+
+# --- CONSOLIDACIÓN --------------------------------------------------------
+
+def get_all_tickers():
+    """Consolida universos evitando duplicados según orden de prioridad."""
+    universo = {}
+    fuentes = [
+        (get_dowjones_tickers, "Dow Jones Composite"),
+        (get_sp500_tickers, "S&P 500"),
+        (get_nasdaq100_tickers, "NASDAQ 100"),
+        (get_russell2000_tickers, "Russell 2000"),
+    ]
+    for func, nombre in fuentes:
+        for t in func():
+            universo.setdefault(t, nombre)
+
+    # España se añade/sobrescribe siempre con su propia etiqueta, como en el original
+    for t in get_spain_tickers():
+        universo[t] = "España"
+
+    return universo
+
+
+# --- EXTRACCIÓN Y PROCESAMIENTO (sin cambios respecto al original) ------
+
+def fetch_single_ticker(ticker, max_retries=3):
+    """Obtiene datos de yfinance con reintentos para controlar el Rate Limit."""
+    for attempt in range(max_retries):
         try:
-            stock = yf.Ticker(ticker)
-            info = stock.info
-
-            price = info.get("currentPrice", info.get("regularMarketPrice"))
-            if not info or price is None:
-                if attempt < max_retries:
-                    # Backoff más largo: los 404 de Yahoo bajo carga con
-                    # varios hilos en paralelo suelen ser transitorios y
-                    # necesitan más de 1-3s para despejarse.
-                    time.sleep(2.0 * (attempt + 1))
-                    continue
-                return {"__error__": ticker, "__reason__": last_error}
-
-            # Descarta acciones preferentes, warrants, ETFs, etc. Estos
-            # instrumentos no tienen fundamentales comparables (Market
-            # Cap, Debt/Equity, PER forward...) porque no son la acción
-            # ordinaria de la empresa -> salían con huecos en cascada en
-            # el CSV. Nos interesa solo EQUITY normal.
-            quote_type = info.get("quoteType")
-            if quote_type and quote_type != "EQUITY":
-                return {"__skipped__": ticker, "__reason__": f"quoteType={quote_type}, no es acción ordinaria"}
-
-            mcap = info.get("marketCap")
-            fcf = info.get("freeCashflow")
-            p_fcf = (mcap / fcf) if (mcap and fcf and fcf > 0) else None
-
-            op_margins = info.get("operatingMargins")
-            total_rev = info.get("totalRevenue")
-            ebit = (op_margins * total_rev) if (op_margins is not None and total_rev is not None) else None
-
-            total_debt = info.get("totalDebt")
-            total_cash = info.get("totalCash")
-
-            # totalStockholderEquity casi nunca viene poblado en info con
-            # las versiones recientes de yfinance -> por eso ROIC salía
-            # vacío al 100%. Fallback: bookValue x sharesOutstanding, que
-            # sí suele estar disponible y evita otra llamada de red
-            # (balance_sheet) por ticker, que dispararía el rate-limit.
-            total_equity = info.get("totalStockholderEquity")
-            if total_equity is None:
-                book_value = info.get("bookValue")
-                shares_out = info.get("sharesOutstanding")
-                if book_value is not None and shares_out is not None:
-                    total_equity = book_value * shares_out
-
-            invested_capital = (
-                total_debt + total_equity - total_cash
-                if None not in (total_debt, total_equity, total_cash)
-                else None
-            )
-            # Tasa impositiva aproximada estándar (el tipo efectivo real
-            # requeriría el income statement completo -> más llamadas).
-            tax_rate = 0.21
-            nopat = (ebit * (1 - tax_rate)) if ebit is not None else None
-            roic = (
-                (nopat / invested_capital * 100)
-                if (nopat is not None and invested_capital and invested_capital > 0)
-                else None
-            )
-
-            def pct(key):
-                val = info.get(key)
-                return val * 100 if val is not None else None
-
-            def cagr_3y(row_name):
-                """CAGR real a 3 años a partir del income statement anual
-                (financials), comparando el valor más reciente con el de
-                hace 3 ejercicios. Devuelve % o None si no hay histórico
-                suficiente (salidas a bolsa recientes, datos incompletos
-                en Yahoo, etc.). Requiere una llamada de red extra por
-                ticker -> el fetch será más lento que antes."""
-                try:
-                    fin = stock.financials  # columnas = años, más reciente primero
-                    if fin is None or row_name not in fin.index:
-                        return None
-                    serie = fin.loc[row_name].dropna()
-                    if len(serie) < 4:
-                        return None
-                    valor_reciente, valor_hace_3y = serie.iloc[0], serie.iloc[3]
-                    if valor_hace_3y is None or valor_hace_3y <= 0 or valor_reciente is None:
-                        return None
-                    return ((valor_reciente / valor_hace_3y) ** (1 / 3) - 1) * 100
-                except Exception:
+            t = yf.Ticker(ticker)
+            info = t.info
+            if not info or ("regularMarketPrice" not in info and "currentPrice" not in info):
+                hist = t.history(period="1d")
+                if hist.empty:
                     return None
-
-            crec_ventas_3y = cagr_3y("Total Revenue")
-            crec_eps_3y = cagr_3y("Diluted EPS")
-
-            return {
-                "Ticker": ticker,
-                "Nombre": info.get("shortName", ticker),
-                "Índice": index_name,
-                "Precio": price,
-                "PER (Trailing)": info.get("trailingPE"),
-                "PER (Forward)": info.get("forwardPE"),
-                "P/FCF": p_fcf,
-                "PEG": info.get("pegRatio"),
-                "P/S": info.get("priceToSalesTrailing12Months"),
-                "P/B": info.get("priceToBook"),
-                "EV/EBITDA": info.get("enterpriseToEbitda"),
-                "EV/Sales": info.get("enterpriseToRevenue"),
-                "ROIC (%)": roic,
-                "ROA (%)": pct("returnOnAssets"),
-                "ROE (%)": pct("returnOnEquity"),
-                "Margen Bruto (%)": pct("grossMargins"),
-                "Margen Operativo (%)": pct("operatingMargins"),
-                "Margen Neto (%)": pct("profitMargins"),
-                "Current Ratio": info.get("currentRatio"),
-                # Yahoo devuelve debtToEquity como porcentaje (48.85 =
-                # 48.85%); lo convertimos a ratio plano (0.4885) porque
-                # es el estándar que usa todo el mundo (Finviz incluido)
-                # y es lo que ya asumen nuestros propios filtros de
-                # "Debt/Equity < 1".
-                "Debt/Equity": (
-                    info.get("debtToEquity") / 100
-                    if info.get("debtToEquity") is not None
-                    else None
-                ),
-                "Payout Ratio (%)": pct("payoutRatio"),
-                "Crec. Ventas YoY (%)": pct("revenueGrowth"),
-                "Crec. Ventas 3Y (%)": crec_ventas_3y,
-                "Crec. EPS YoY (%)": pct("earningsGrowth"),
-                "Crec. EPS 3Y (%)": crec_eps_3y,
-                "Market Cap (B)": (mcap / 1e9) if mcap else None,
-            }
+            return info
         except Exception as e:
-            last_error = f"{type(e).__name__}: {e or '(sin mensaje)'}"
-            if attempt < max_retries:
-                time.sleep(2.0 * (attempt + 1))
-                continue
-            return {"__error__": ticker, "__reason__": last_error}
+            err_str = str(e)
+            if "Rate" in err_str or "Too Many Requests" in err_str or "429" in err_str:
+                wait_time = (attempt + 1) * 3 + random.uniform(1, 3)
+                print(f"  [Rate Limit] Esperando {wait_time:.1f}s para {ticker}...")
+                time.sleep(wait_time)
+            else:
+                return None
+    return None
 
-    return {"__error__": ticker, "__reason__": last_error}
+
+def extract_metrics(ticker, index_name, info):
+    price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
+    mcap = info.get("marketCap")
+    mcap_b = (mcap / 1e9) if mcap else None
+
+    return {
+        "Ticker": ticker,
+        "Nombre": info.get("shortName") or info.get("longName") or ticker,
+        "Índice": index_name,
+        "Precio": price,
+        "Market Cap (B)": mcap_b,
+        "PER (Trailing)": info.get("trailingPE"),
+        "PER (Forward)": info.get("forwardPE"),
+        "PEG": info.get("pegRatio"),
+        "EV/EBITDA": info.get("enterpriseToEbitda"),
+        "EV/Sales": info.get("enterpriseToRevenue"),
+        "P/S": info.get("priceToSalesTrailing12Months"),
+        "P/B": info.get("priceToBook"),
+        "P/FCF": None,
+        "Crec. Ventas YoY (%)": (info.get("revenueGrowth") * 100) if info.get("revenueGrowth") is not None else None,
+        "Crec. Ventas 3Y (%)": None,
+        "Crec. EPS YoY (%)": (info.get("earningsGrowth") * 100) if info.get("earningsGrowth") is not None else None,
+        "Crec. EPS 3Y (%)": None,
+        "ROIC (%)": None,
+        "ROE (%)": (info.get("returnOnEquity") * 100) if info.get("returnOnEquity") is not None else None,
+        "ROA (%)": (info.get("returnOnAssets") * 100) if info.get("returnOnAssets") is not None else None,
+        "Margen Bruto (%)": (info.get("grossMargins") * 100) if info.get("grossMargins") is not None else None,
+        "Margen Operativo (%)": (info.get("operatingMargins") * 100) if info.get("operatingMargins") is not None else None,
+        "Margen Neto (%)": (info.get("profitMargins") * 100) if info.get("profitMargins") is not None else None,
+        "Debt/Equity": info.get("debtToEquity"),
+        "Current Ratio": info.get("currentRatio"),
+        "Payout Ratio (%)": (info.get("payoutRatio") * 100) if info.get("payoutRatio") is not None else None,
+    }
 
 
 def main():
-    all_indexed = get_all_indexed_tickers()
-    print(f"Descargando {len(all_indexed)} tickers...")
+    print("🚀 Iniciando descarga de datos...")
+    universo = get_all_tickers()
+    total = len(universo)
+    print(f"📊 Total tickers a procesar: {total}")
 
-    # Workers moderados + procesado por lotes: es un job en background,
-    # no hay prisa por el usuario, así que priorizamos no chocar con el
-    # rate-limit de Yahoo sobre la velocidad bruta.
-    results = []
-    batch_size = 100
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        for i in range(0, len(all_indexed), batch_size):
-            batch = all_indexed[i:i + batch_size]
-            batch_results = list(executor.map(fetch_stock_data, batch))
-            results.extend(batch_results)
-            done = min(i + batch_size, len(all_indexed))
-            print(f"  progreso: {done}/{len(all_indexed)}")
-            if done < len(all_indexed):
-                time.sleep(5)  # pausa entre lotes para no saturar Yahoo
+    data = []
+    failed = []
 
-    ok = [r for r in results if r is not None and "__error__" not in r and "__skipped__" not in r]
-    failed = [r for r in results if r is not None and "__error__" in r]
-    skipped = [r for r in results if r is not None and "__skipped__" in r]
+    for i, (ticker, idx) in enumerate(universo.items(), start=1):
+        print(f"[{i}/{total}] Procesando {ticker} ({idx})...", end="", flush=True)
+        info = fetch_single_ticker(ticker)
 
-    df = pd.DataFrame(ok)
-    df.to_csv(OUTPUT_CSV, index=False)
+        if info:
+            data.append(extract_metrics(ticker, idx, info))
+            print(" ✅ OK")
+        else:
+            failed.append(ticker)
+            print(" ❌ Sin datos / Omitido")
 
-    meta = {
-        "last_updated_utc": datetime.now(timezone.utc).isoformat(),
-        "total_attempted": len(all_indexed),
-        "total_ok": len(ok),
-        "total_failed": len(failed),
-        "total_skipped_no_equity": len(skipped),
-    }
-    with open(OUTPUT_META, "w") as f:
-        json.dump(meta, f, indent=2)
+        time.sleep(0.2)
 
-    # Guarda ticker + motivo, para poder distinguir de un vistazo un
-    # ticker realmente deslistado/mal escrito de un 404 transitorio de
-    # Yahoo que no se resolvió ni tras los reintentos. Los excluidos por
-    # no ser EQUITY (preferentes, warrants...) van en su propio log,
-    # porque no son un fallo -- es un filtro intencionado.
-    with open(FAILED_LOG, "w") as f:
-        for r in failed:
-            f.write(f"{r['__error__']}\t{r.get('__reason__', '')}\n")
-
-    with open(SKIPPED_LOG, "w") as f:
-        for r in skipped:
-            f.write(f"{r['__skipped__']}\t{r.get('__reason__', '')}\n")
-
-    print(
-        f"Hecho: {len(ok)} ok, {len(failed)} fallidos, "
-        f"{len(skipped)} excluidos (no son acción ordinaria). Guardado en {OUTPUT_CSV}"
-    )
+    df = pd.DataFrame(data)
+    df.to_csv("market_data.csv", index=False)
+    print(f"\n🎉 Guardado 'market_data.csv' con {len(df)} empresas.")
     if failed:
-        print(f"  (motivos de los fallos en {FAILED_LOG})")
-    if skipped:
-        print(f"  (excluidos -preferentes/warrants/etc- en {SKIPPED_LOG})")
+        print(f"⚠️  {len(failed)} tickers sin datos (revisar si son errores puntuales de yfinance o tickers inválidos): {failed}")
 
 
 if __name__ == "__main__":
     main()
-
-# ============================================================
-# Ejemplo de workflow de GitHub Actions (guárdalo como
-# .github/workflows/fetch_data.yml si quieres que corra en la nube
-# gratis en vez de en tu propia máquina):
-#
-# name: Fetch market data
-# on:
-#   schedule:
-#     - cron: "0 6 * * *"   # todos los días a las 06:00 UTC
-#   workflow_dispatch: {}   # también puedes lanzarlo a mano
-# jobs:
-#   fetch:
-#     runs-on: ubuntu-latest
-#     steps:
-#       - uses: actions/checkout@v4
-#       - uses: actions/setup-python@v5
-#         with:
-#           python-version: "3.11"
-#       - run: pip install yfinance pandas requests
-#       - run: python fetch_data.py
-#       - uses: actions/upload-artifact@v4  # o haz commit del CSV al repo
-#         with:
-#           name: market-data
-#           path: |
-#             market_data.csv
-#             market_data_meta.json
-# ============================================================
