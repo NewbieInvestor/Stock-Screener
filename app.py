@@ -85,7 +85,7 @@ def load_ticker_extra(ticker):
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_deep_metrics(ticker, current_price):
-    """Calcula ROIC exacto y DCF extrayendo balances pesados."""
+    """Calcula ROIC exacto y DCF extrayendo balances pesados con fallbacks internacionales."""
     t = yf.Ticker(ticker)
     
     # 1. Calcular ROIC Exacto
@@ -93,20 +93,46 @@ def get_deep_metrics(ticker, current_price):
     try:
         inc_stmt = t.income_stmt
         bal_sheet = t.balance_sheet
+        
         if not inc_stmt.empty and not bal_sheet.empty:
-            ebit = inc_stmt.loc["EBIT"].iloc[0] if "EBIT" in inc_stmt.index else inc_stmt.loc["Operating Income"].iloc[0]
-            pretax_income = inc_stmt.loc["Pretax Income"].iloc[0]
-            tax_provision = inc_stmt.loc["Tax Provision"].iloc[0]
-            tax_rate = tax_provision / pretax_income if pretax_income > 0 else 0.21
-            nopat = ebit * (1 - tax_rate)
+            # Fallback para EBIT
+            ebit = None
+            for k in ["EBIT", "Operating Income", "Operating Revenue"]:
+                if k in inc_stmt.index and not inc_stmt.loc[k].dropna().empty:
+                    ebit = inc_stmt.loc[k].iloc[0]
+                    break
             
-            total_debt = bal_sheet.loc["Total Debt"].iloc[0] if "Total Debt" in bal_sheet.index else 0
-            total_equity = bal_sheet.loc["Stockholders Equity"].iloc[0]
-            cash = bal_sheet.loc["Cash And Cash Equivalents"].iloc[0] if "Cash And Cash Equivalents" in bal_sheet.index else 0
+            pretax_income = inc_stmt.loc["Pretax Income"].iloc[0] if "Pretax Income" in inc_stmt.index and not inc_stmt.loc["Pretax Income"].dropna().empty else None
+            tax_provision = inc_stmt.loc["Tax Provision"].iloc[0] if "Tax Provision" in inc_stmt.index and not inc_stmt.loc["Tax Provision"].dropna().empty else None
             
-            invested_capital = total_debt + total_equity - cash
-            if invested_capital > 0:
-                roic = (nopat / invested_capital) * 100
+            tax_rate = (tax_provision / pretax_income) if (pretax_income and tax_provision and pretax_income > 0) else 0.21
+            nopat = ebit * (1 - tax_rate) if ebit is not None else None
+            
+            # Fallback Deuda Total
+            total_debt = 0
+            for k in ["Total Debt", "Long Term Debt And Capital Lease Obligation", "Net Debt"]:
+                if k in bal_sheet.index and not bal_sheet.loc[k].dropna().empty:
+                    total_debt = bal_sheet.loc[k].iloc[0]
+                    break
+            
+            # Fallback Patrimonio Neto
+            total_equity = None
+            for k in ["Stockholders Equity", "Total Stockholder Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"]:
+                if k in bal_sheet.index and not bal_sheet.loc[k].dropna().empty:
+                    total_equity = bal_sheet.loc[k].iloc[0]
+                    break
+                    
+            # Fallback Caja
+            cash = 0
+            for k in ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments", "Cash Financial"]:
+                if k in bal_sheet.index and not bal_sheet.loc[k].dropna().empty:
+                    cash = bal_sheet.loc[k].iloc[0]
+                    break
+            
+            if nopat is not None and total_equity is not None:
+                invested_capital = total_debt + total_equity - cash
+                if invested_capital > 0:
+                    roic = (nopat / invested_capital) * 100
     except Exception:
         pass
         
@@ -115,12 +141,35 @@ def get_deep_metrics(ticker, current_price):
     mos = None
     try:
         cash_flow = t.cash_flow
-        info = t.info
-        if not cash_flow.empty and "Free Cash Flow" in cash_flow.index:
-            historical_fcf = cash_flow.loc["Free Cash Flow"].dropna().head(3)
-            if len(historical_fcf) > 0 and historical_fcf.mean() > 0:
+        info = t.info or {}
+        
+        fcf_series = None
+        if not cash_flow.empty:
+            if "Free Cash Flow" in cash_flow.index and not cash_flow.loc["Free Cash Flow"].dropna().empty:
+                fcf_series = cash_flow.loc["Free Cash Flow"].dropna()
+            else:
+                # Fallback: OCF - CapEx
+                ocf = None
+                for k in ["Operating Cash Flow", "Cash Flow From Continued Operating Activities", "Total Cash From Operating Activities"]:
+                    if k in cash_flow.index and not cash_flow.loc[k].dropna().empty:
+                        ocf = cash_flow.loc[k]
+                        break
+                capex = None
+                for k in ["Capital Expenditure", "Capital Expenditures", "Capital Expenditure Report"]:
+                    if k in cash_flow.index and not cash_flow.loc[k].dropna().empty:
+                        capex = cash_flow.loc[k]
+                        break
+                if ocf is not None:
+                    if capex is not None:
+                        fcf_series = (ocf + capex).dropna() # CapEx suele ser negativo
+                    else:
+                        fcf_series = ocf.dropna()
+
+        if fcf_series is not None and len(fcf_series) > 0:
+            historical_fcf = fcf_series.head(3)
+            if historical_fcf.mean() > 0:
                 base_fcf = historical_fcf.mean()
-                fcf_growth = 0.05 # Crecimiento conservador
+                fcf_growth = 0.05 # Crecimiento conservador 5%
                 
                 projected_fcf = [base_fcf * ((1 + fcf_growth) ** i) for i in range(1, PROJECTION_YEARS + 1)]
                 discounted_fcf = sum([fcf / ((1 + WACC) ** i) for i, fcf in enumerate(projected_fcf, 1)])
@@ -131,15 +180,26 @@ def get_deep_metrics(ticker, current_price):
                 enterprise_value = discounted_fcf + discounted_tv
                 
                 bal_sheet = t.balance_sheet
-                total_debt = bal_sheet.loc["Total Debt"].iloc[0] if "Total Debt" in bal_sheet.index else 0
-                cash = bal_sheet.loc["Cash And Cash Equivalents"].iloc[0] if "Cash And Cash Equivalents" in bal_sheet.index else 0
+                total_debt = 0
+                if not bal_sheet.empty:
+                    for k in ["Total Debt", "Long Term Debt And Capital Lease Obligation"]:
+                        if k in bal_sheet.index and not bal_sheet.loc[k].dropna().empty:
+                            total_debt = bal_sheet.loc[k].iloc[0]
+                            break
+                
+                cash = 0
+                if not bal_sheet.empty:
+                    for k in ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"]:
+                        if k in bal_sheet.index and not bal_sheet.loc[k].dropna().empty:
+                            cash = bal_sheet.loc[k].iloc[0]
+                            break
                 
                 equity_value = enterprise_value - total_debt + cash
                 shares_out = info.get("sharesOutstanding")
                 
-                if shares_out:
+                if shares_out and shares_out > 0:
                     intrinsic_value = equity_value / shares_out
-                    if intrinsic_value > 0 and current_price:
+                    if intrinsic_value > 0 and current_price and current_price > 0:
                         mos = ((intrinsic_value - current_price) / intrinsic_value) * 100
     except Exception:
         pass
@@ -164,15 +224,30 @@ def fmt_val(val, is_pct=False, is_money=False, multiplier=1.0):
     except Exception:
         return str(val)
 
-# PRESETS DE FILTROS
+# PRESETS DE FILTROS REVISADOS
 VALUATION_PRESETS = [("Cualquiera", None, None), ("Positivo (>0)", 0, None), ("Bajo (<10)", None, 10), ("Bajo (<15)", None, 15), ("Bajo (<20)", None, 20), ("Bajo (<30)", None, 30), ("Bajo (<50)", None, 50), ("Alto (>50)", 50, None), ("Negativo (<0)", None, 0), ("Personalizado", "custom", "custom")]
 GROWTH_PRESETS = [("Cualquiera", None, None), ("Positivo (>0%)", 0, None), ("Over 5%", 5, None), ("Over 10%", 10, None), ("Over 15%", 15, None), ("Over 20%", 20, None), ("Over 30%", 30, None), ("Over 50%", 50, None), ("Negativo (<0%)", None, 0), ("Personalizado", "custom", "custom")]
 RATIO_PRESETS = [("Cualquiera", None, None), ("Bajo (<1)", None, 1), ("Bajo (<2)", None, 2), ("Moderado (<0.5)", None, 0.5), ("Alto (>2)", 2, None), ("Personalizado", "custom", "custom")]
 PB_PRESETS = [("Cualquiera", None, None), ("Positivo (>0)", 0, None), ("Bajo (<1)", None, 1), ("Bajo (<2)", None, 2), ("Bajo (<3)", None, 3), ("Bajo (<5)", None, 5), ("Bajo (<10)", None, 10), ("Alto (>10)", 10, None), ("Negativo (<0)", None, 0), ("Personalizado", "custom", "custom")]
 MCAP_PRESETS = [("Cualquiera", None, None), ("Mega (200bln+)", 200, None), ("Large (10bln-200bln)", 10, 200), ("Mid (2bln-10bln)", 2, 10), ("Small (300mln-2bln)", 0.3, 2), ("Micro (50mln-300mln)", 0.05, 0.3), ("Nano (under 50mln)", None, 0.05), ("+Large (over 10bln)", 10, None), ("+Mid (over 2bln)", 2, None), ("+Small (over 300mln)", 0.3, None), ("+Micro (over 50mln)", 0.05, None), ("-Large (under 200bln)", None, 200), ("-Mid (under 10bln)", None, 10), ("-Small (under 2bln)", None, 2), ("-Micro (under 300mln)", None, 0.3), ("Personalizado", "custom", "custom")]
 
+# NUEVOS PRESETS ESPECÍFICOS
+PEG_PRESETS = [("Cualquiera", None, None), ("Muy Bajo (<0.5)", None, 0.5), ("Bajo (<1.0)", None, 1.0), ("Bajo (<1.5)", None, 1.5), ("Moderado (<2.0)", None, 2.0), ("Alto (>2.0)", 2.0, None), ("Negativo (<0)", None, 0), ("Personalizado", "custom", "custom")]
+DEBT_EQUITY_PRESETS = [("Cualquiera", None, None), ("Sin Deuda / Muy Bajo (<0.2)", None, 0.2), ("Bajo (<0.5)", None, 0.5), ("Saludable (<1.0)", None, 1.0), ("Moderado (<1.5)", None, 1.5), ("Moderado (<2.0)", None, 2.0), ("Alto (>2.0)", 2.0, None), ("Personalizado", "custom", "custom")]
+CURRENT_RATIO_PRESETS = [("Cualquiera", None, None), ("Fuerte (>2.0)", 2.0, None), ("Saludable (>1.5)", 1.5, None), ("Aceptable (>1.0)", 1.0, None), ("Bajo (<1.0)", None, 1.0), ("Peligro (<0.5)", None, 0.5), ("Personalizado", "custom", "custom")]
+
 def finviz_filter(col, label, kind="growth", key_prefix=""):
-    presets = {"valuation": VALUATION_PRESETS, "growth": GROWTH_PRESETS, "ratio": RATIO_PRESETS, "mcap": MCAP_PRESETS, "pb": PB_PRESETS}[kind]
+    presets = {
+        "valuation": VALUATION_PRESETS,
+        "growth": GROWTH_PRESETS,
+        "ratio": RATIO_PRESETS,
+        "mcap": MCAP_PRESETS,
+        "pb": PB_PRESETS,
+        "peg": PEG_PRESETS,
+        "debt_equity": DEBT_EQUITY_PRESETS,
+        "current_ratio": CURRENT_RATIO_PRESETS,
+    }[kind]
+    
     labels = [p[0] for p in presets]
     key = f"{key_prefix}_{col}"
     choice = st.selectbox(label, labels, key=key)
@@ -251,7 +326,7 @@ def main():
             sels["EV/Sales"] = finviz_filter("EV/Sales", "EV/Sales", "valuation", "val")
         with c3:
             sels["P/B"] = finviz_filter("P/B", "P/B", "pb", "val")
-            sels["PEG"] = finviz_filter("PEG", "PEG", "valuation", "val")
+            sels["PEG"] = finviz_filter("PEG", "PEG", "peg", "val")
         with c4:
             sels["P/FCF"] = finviz_filter("P/FCF", "P/FCF", "valuation", "val")
             sels["P/S"] = finviz_filter("P/S", "P/S", "valuation", "val")
@@ -282,9 +357,9 @@ def main():
     with tab_sal:
         c1, c2, c3 = st.columns(3)
         with c1:
-            sels["Debt/Equity"] = finviz_filter("Debt/Equity", "Debt/Equity", "ratio", "sal")
+            sels["Debt/Equity"] = finviz_filter("Debt/Equity", "Debt/Equity", "debt_equity", "sal")
         with c2:
-            sels["Current Ratio"] = finviz_filter("Current Ratio", "Current Ratio", "ratio", "sal")
+            sels["Current Ratio"] = finviz_filter("Current Ratio", "Current Ratio", "current_ratio", "sal")
         with c3:
             sels["Payout Ratio (%)"] = finviz_filter("Payout Ratio (%)", "Payout Ratio", "growth", "sal")
 
@@ -319,21 +394,34 @@ def main():
     st.subheader(f"Resultados: {len(resultado)} empresas")
     st.dataframe(resultado, use_container_width=True, height=350)
 
-    # --- SECCIÓN NUEVA: ANÁLISIS PROFUNDO ---
+    # --- SECCIÓN: ANÁLISIS PROFUNDO ---
     st.markdown("---")
     st.subheader("🧠 Análisis Profundo (DCF y ROIC Exacto)")
-    st.write("Calcula el Valor Intrínseco y ROIC real para las empresas filtradas en la tabla de arriba conectándose a sus estados financieros.")
+    st.write("Calcula el Valor Intrínseco y ROIC real para las empresas filtradas en la tabla conectándose directamente a sus balances.")
     
+    with st.expander("ℹ️ ¿Cómo se calculan el Valor Intrínseco (DCF) y el ROIC?"):
+        st.markdown("""
+        **1. Valor Intrínseco (Modelo de Descuento de Flujos de Caja - DCF):**
+        * **Base de FCF:** Promedio del Free Cash Flow de los últimos 3 años (o Flujo Operativo - CapEx).
+        * **Proyección (5 años):** Se proyecta el FCF con una tasa de crecimiento conservadora del **5% anual**.
+        * **Tasa de Descuento (WACC):** Se descuenta cada flujo al **10% anual**.
+        * **Valor Terminal:** Calculado con la fórmula de Gordon Growth a un **2.5% de crecimiento perpetuo**.
+        * **Ajuste de Deuda Neto:** $\\text{Enterprise Value} + \\text{Caja} - \\text{Deuda Total} = \\text{Equity Value}$.
+        * **Por Acción:** $\\text{Equity Value} / \\text{Número de Acciones}$.
+        
+        **2. Rentabilidad sobre el Capital Invertido (ROIC Exacto):**
+        $$ROIC = \\frac{\\text{NOPAT}}{\\text{Capital Invertido}} = \\frac{\\text{EBIT} \\times (1 - \\text{Tasa Impositiva})}{\\text{Deuda Total} + \\text{Patrimonio Neto} - \\text{Caja}}$$
+        """)
+
     if st.button("🚀 Ejecutar Análisis Profundo", type="primary"):
         if len(resultado) == 0:
             st.warning("⚠️ No hay ninguna empresa en los resultados para analizar.")
         elif len(resultado) > 20:
-            st.warning(f"⚠️ Tienes {len(resultado)} empresas en pantalla. Por favor, usa los filtros de arriba para reducir la lista a un máximo de 20. Si haces más, Yahoo Finance podría bloquear tu conexión por hacer demasiadas peticiones de golpe.")
+            st.warning(f"⚠️ Tienes {len(resultado)} empresas en pantalla. Por favor, filtra para dejar un máximo de 20 antes de ejecutar la petición.")
         else:
             deep_results = []
             tickers_list = resultado["Ticker"].tolist()
             
-            # Barra de progreso
             progress_bar = st.progress(0, text="Iniciando conexión con balances...")
             
             for i, ticker in enumerate(tickers_list):
