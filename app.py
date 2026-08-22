@@ -119,15 +119,82 @@ def get_historical_pe(ticker_obj, years=5):
                     if 2 < pe_year < 150:  # Filtrar anomalías numéricas puntuales
                         annual_pes.append(pe_year)
 
-        if annual_pes:
+        if len(annual_pes) >= 2:  # Evita una "media" basada en un único año (poco histórico)
             return sum(annual_pes) / len(annual_pes)
     except Exception:
         pass
     return None
 
+def get_cagr_growth(inc_stmt):
+    """Calcula el CAGR de Ventas y EPS con los años disponibles en el income_stmt YA descargado
+    (lo reutiliza de la llamada que ya hace get_deep_metrics para el ROIC — no añade llamadas de red).
+    Devuelve None si el año base es <= 0 (el CAGR no tiene sentido matemático ahí)."""
+    rev_cagr = None
+    eps_cagr = None
+    try:
+        if inc_stmt is None or inc_stmt.empty:
+            return None, None
+
+        rev_row = get_df_row(inc_stmt, ["total revenue", "operating revenue", "ingresos totales"])
+        eps_row = get_df_row(inc_stmt, ["diluted eps", "basic eps", "beneficio por accion"])
+
+        for row, is_eps in [(rev_row, False), (eps_row, True)]:
+            if row is None or len(row) < 2:
+                continue
+            row_sorted = row.sort_index()  # más antiguo primero
+            oldest, newest = row_sorted.iloc[0], row_sorted.iloc[-1]
+            n_years = len(row_sorted) - 1
+            if pd.notna(oldest) and pd.notna(newest) and oldest > 0 and n_years > 0:
+                cagr = ((newest / oldest) ** (1 / n_years) - 1) * 100
+                if is_eps:
+                    eps_cagr = cagr
+                else:
+                    rev_cagr = cagr
+    except Exception:
+        pass
+    return rev_cagr, eps_cagr
+
+# --- CAVEATS DE FIABILIDAD POR SECTOR/INDUSTRIA ---
+# Palabras clave (en minúsculas) para detectar sectores donde estos modelos
+# estándar (DCF por FCF, ROIC, PER histórico) son menos representativos.
+FINANCIAL_KEYWORDS = ["financial", "bank", "insurance", "capital markets", "mortgage", "asset management"]
+REAL_ESTATE_KEYWORDS = ["real estate", "reit"]
+CYCLICAL_KEYWORDS = ["oil & gas", "steel", "airlines", "auto manufacturers", "auto parts",
+                      "semiconductor", "copper", "gold", "coal", "aluminum", "metals & mining",
+                      "shipping", "chemicals", "uranium", "drilling", "iron", "lumber"]
+
+def get_valuation_caveats(sector, industry):
+    """Indica qué métricas del Análisis Profundo son menos fiables para este sector/industria."""
+    sector_l = str(sector).lower()
+    industry_l = str(industry).lower()
+
+    is_fin = any(kw in sector_l or kw in industry_l for kw in FINANCIAL_KEYWORDS)
+    is_re = any(kw in sector_l or kw in industry_l for kw in REAL_ESTATE_KEYWORDS)
+    is_util = "utilities" in sector_l
+    is_cyclical = any(kw in industry_l for kw in CYCLICAL_KEYWORDS)
+
+    flags = {"dcf": False, "roic": False, "per_hist": False}
+    reasons = []
+
+    if is_fin or is_re:
+        flags["dcf"] = True
+        flags["roic"] = True
+        reasons.append("Financiero/REIT: el FCF y el ROIC no reflejan bien este modelo de negocio "
+                        "(la deuda es materia prima, no capital invertido) — mejor mirar ROE/ROA.")
+    if is_util:
+        flags["roic"] = True
+        reasons.append("Utility regulada: el ROIC vs WACC pierde sentido porque el retorno lo fija el regulador.")
+    if is_cyclical:
+        flags["per_hist"] = True
+        reasons.append("Sector cíclico: el PER histórico medio puede reflejar un pico o un valle de beneficio, "
+                        "no una valoración real.")
+
+    return flags, reasons
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_deep_metrics(ticker, current_price):
-    """Calcula ROIC exacto, PER Histórico propio, FCF Medio y Valor Intrínseco por DCF, EPS Actual y EPS 5Y."""
+    """Calcula ROIC exacto, PER Histórico propio, FCF Medio, Valor Intrínseco (DCF, EPS Actual y EPS 5Y)
+    y CAGR de Ventas/EPS de los últimos años disponibles."""
     t = yf.Ticker(ticker)
     info = {}
     try:
@@ -148,6 +215,7 @@ def get_deep_metrics(ticker, current_price):
     
     # 1. ROIC Exacto
     roic = None
+    inc_stmt = None
     try:
         inc_stmt = t.income_stmt
         bal_sheet = t.balance_sheet
@@ -180,6 +248,10 @@ def get_deep_metrics(ticker, current_price):
                 roic = (nopat / invested_capital) * 100
     except Exception:
         pass
+
+    # 1b. Crecimiento CAGR 3-4 años (Ventas y EPS) — reutiliza el income_stmt ya descargado arriba,
+    # no hace ninguna llamada de red adicional.
+    rev_cagr, eps_cagr = get_cagr_growth(inc_stmt)
         
     # 2. DCF (FCF Medio 3 Años)
     intrinsic_dcf = None
@@ -247,7 +319,7 @@ def get_deep_metrics(ticker, current_price):
         future_price = future_eps * pe_hist
         iv_pe_growth = future_price / ((1 + WACC) ** PROJECTION_YEARS)
 
-    return roic, intrinsic_dcf, pe_hist, iv_pe_actual, iv_pe_growth, status_note, mean_fcf
+    return roic, intrinsic_dcf, pe_hist, iv_pe_actual, iv_pe_growth, status_note, mean_fcf, sector, industry, rev_cagr, eps_cagr
 
 def fmt_val(val, is_pct=False, is_money=False, multiplier=1.0):
     if val is None or pd.isna(val):
@@ -371,20 +443,18 @@ def main():
             sels["P/S"] = finviz_filter("P/S", "P/S", "valuation", "val")
 
     with tab_gro:
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2 = st.columns(2)
         with c1:
             sels["Crec. Ventas YoY (%)"] = finviz_filter("Crec. Ventas YoY (%)", "Crec. Ventas YoY", "growth", "gro")
         with c2:
-            sels["Crec. Ventas 3Y (%)"] = finviz_filter("Crec. Ventas 3Y (%)", "Crec. Ventas 3Y", "growth", "gro")
-        with c3:
             sels["Crec. EPS YoY (%)"] = finviz_filter("Crec. EPS YoY (%)", "Crec. EPS YoY", "growth", "gro")
-        with c4:
-            sels["Crec. EPS 3Y (%)"] = finviz_filter("Crec. EPS 3Y (%)", "Crec. EPS 3Y", "growth", "gro")
+        st.caption("El crecimiento a 3 años (CAGR de Ventas y EPS) se calcula en el Análisis Profundo, "
+                   "no aquí — requiere histórico de varios años que no merece la pena descargar para las 2.500+ empresas del universo.")
 
     with tab_rent:
         c1, c2, c3 = st.columns(3)
         with c1:
-            sels["ROIC (%)"] = finviz_filter("ROIC (%)", "ROIC", "growth", "cal")
+            sels["ROIC Aprox. (%)"] = finviz_filter("ROIC Aprox. (%)", "ROIC (Aprox.)", "growth", "cal")
             sels["Margen Bruto (%)"] = finviz_filter("Margen Bruto (%)", "Margen Bruto", "growth", "cal")
         with c2:
             sels["ROE (%)"] = finviz_filter("ROE (%)", "ROE", "growth", "cal")
@@ -453,6 +523,16 @@ def main():
 
         **4. Rentabilidad sobre Capital Invertido (ROIC Exacto):**
         $$ROIC = \\frac{\\text{NOPAT}}{\\text{Capital Invertido}} = \\frac{\\text{EBIT} \\times (1 - \\text{Tasa Impositiva})}{\\text{Deuda Total} + \\text{Patrimonio Neto} - \\text{Caja}}$$
+
+        **5. Crecimiento CAGR (Ventas y EPS):**
+        * Tasa de crecimiento anual compuesto entre el año más antiguo y el más reciente disponibles en el
+          income statement (normalmente 3-4 años). Se omite si el año base es negativo o cero (el CAGR no
+          tiene sentido matemático ahí) — verás "N/A" en esos casos, no un cero falso.
+
+        **⚠️ Limitaciones por sector:** estos modelos asumen supuestos genéricos (WACC 10%, crecimiento 5%,
+        terminal 2.5%) iguales para cualquier empresa, y no funcionan igual de bien en todos los sectores
+        (financieras, REITs, utilities reguladas, cíclicas...). Las celdas marcadas con **\\*** en la tabla
+        indican una métrica con fiabilidad reducida para esa empresa concreta — revisa la leyenda bajo la tabla.
         """)
 
     if st.button("🚀 Ejecutar Análisis Profundo", type="primary"):
@@ -462,6 +542,7 @@ def main():
             st.warning(f"⚠️ Tienes {len(resultado)} empresas en pantalla. Filtra para dejar un máximo de 25 antes de ejecutar la petición.")
         else:
             deep_results = []
+            all_reasons = []
             tickers_list = resultado["Ticker"].tolist()
             
             progress_bar = st.progress(0, text="Iniciando conexión con balances...")
@@ -472,18 +553,35 @@ def main():
                 nombre = resultado.loc[resultado["Ticker"] == ticker, "Nombre"].values[0]
                 precio_actual = resultado.loc[resultado["Ticker"] == ticker, "Precio"].values[0]
                 
-                roic, iv_dcf, pe_hist, iv_pe_act, iv_pe_gro, note, mean_fcf = get_deep_metrics(ticker, precio_actual)
+                roic, iv_dcf, pe_hist, iv_pe_act, iv_pe_gro, note, mean_fcf, sector, industry, rev_cagr, eps_cagr = get_deep_metrics(ticker, precio_actual)
+
+                flags, reasons = get_valuation_caveats(sector, industry)
+                all_reasons.extend(reasons)
+
+                def _mark(value, flagged):
+                    """Añade * al valor si la métrica está marcada como poco fiable para este sector."""
+                    return f"{value}*" if (flagged and value != "N/A") else value
+
+                iv_dcf_val = round(iv_dcf, 2) if iv_dcf else (note if note else "N/A")
+                pe_hist_val = round(pe_hist, 1) if pe_hist else "N/A"
+                iv_pe_act_val = round(iv_pe_act, 2) if iv_pe_act else "N/A"
+                iv_pe_gro_val = round(iv_pe_gro, 2) if iv_pe_gro else "N/A"
+                roic_val = round(roic, 2) if roic else "N/A"
+                rev_cagr_val = round(rev_cagr, 2) if rev_cagr is not None else "N/A"
+                eps_cagr_val = round(eps_cagr, 2) if eps_cagr is not None else "N/A"
 
                 deep_results.append({
                     "Ticker": ticker,
                     "Nombre": nombre,
                     "Precio Actual": round(precio_actual, 2) if pd.notna(precio_actual) else "N/A",
                     "FCF": fmt_val(mean_fcf, is_money=True) if mean_fcf is not None else "N/A",
-                    "IV DCF (FCF)": round(iv_dcf, 2) if iv_dcf else (note if note else "N/A"),
-                    "PER Hist. Medio": round(pe_hist, 1) if pe_hist else "N/A",
-                    "IV PER (EPS Actual)": round(iv_pe_act, 2) if iv_pe_act else "N/A",
-                    "IV PER (EPS 5Y Growth)": round(iv_pe_gro, 2) if iv_pe_gro else "N/A",
-                    "ROIC Exacto (%)": round(roic, 2) if roic else "N/A"
+                    "IV DCF (FCF)": _mark(iv_dcf_val, flags["dcf"]),
+                    "PER Hist. Medio": _mark(pe_hist_val, flags["per_hist"]),
+                    "IV PER (EPS Actual)": _mark(iv_pe_act_val, flags["per_hist"]),
+                    "IV PER (EPS 5Y Growth)": _mark(iv_pe_gro_val, flags["per_hist"]),
+                    "ROIC Exacto (%)": _mark(roic_val, flags["roic"]),
+                    "Crec. Ventas CAGR (%)": rev_cagr_val,
+                    "Crec. EPS CAGR (%)": eps_cagr_val,
                 })
                            
             progress_bar.empty()
@@ -491,6 +589,11 @@ def main():
             
             df_deep = pd.DataFrame(deep_results)
             st.dataframe(df_deep, hide_index=True, use_container_width=True)
+
+            if all_reasons:
+                unique_reasons = sorted(set(all_reasons))
+                leyenda = "  \n".join(f"* {r}" for r in unique_reasons)
+                st.caption(leyenda)
 
     # --- SECCIÓN: FICHA DE EMPRESA ---
     st.markdown("---")
@@ -598,16 +701,15 @@ def main():
             ("Profit Margin", fmt_val(extra.get("profit_margins") or (row.get("Margen Neto (%)") / 100 if pd.notna(row.get("Margen Neto (%)")) else None), is_pct=True)),
             ("ROE", fmt_val(extra.get("roe") or (row.get("ROE (%)") / 100 if pd.notna(row.get("ROE (%)")) else None), is_pct=True)),
             ("ROA", fmt_val(extra.get("roa") or (row.get("ROA (%)") / 100 if pd.notna(row.get("ROA (%)")) else None), is_pct=True)),
-            ("ROIC", fmt_val(row.get("ROIC (%)") / 100 if pd.notna(row.get("ROIC (%)")) else None, is_pct=True)),
+            ("ROIC (Aprox.)", fmt_val(row.get("ROIC Aprox. (%)") / 100 if pd.notna(row.get("ROIC Aprox. (%)")) else None, is_pct=True)),
         ])
 
     with col2:
         render_block("GROWTH", [
             ("Revenue Growth", fmt_val(extra.get("rev_growth") or (row.get("Crec. Ventas YoY (%)") / 100 if pd.notna(row.get("Crec. Ventas YoY (%)")) else None), is_pct=True)),
             ("Earnings Growth", fmt_val(extra.get("earnings_growth") or (row.get("Crec. EPS YoY (%)") / 100 if pd.notna(row.get("Crec. EPS YoY (%)")) else None), is_pct=True)),
-            ("Revenue Growth 3Y", fmt_val(row.get("Crec. Ventas 3Y (%)") / 100 if pd.notna(row.get("Crec. Ventas 3Y (%)")) else None, is_pct=True)),
-            ("EPS Growth 3Y", fmt_val(row.get("Crec. EPS 3Y (%)") / 100 if pd.notna(row.get("Crec. EPS 3Y (%)")) else None, is_pct=True)),
         ])
+        st.caption("Crecimiento a 3 años (CAGR): disponible en la sección Análisis Profundo, más arriba.")
 
         render_block("CASH FLOW & LEVERAGE", [
             ("Operating CF", fmt_val(extra.get("operating_cf"), is_money=True)),

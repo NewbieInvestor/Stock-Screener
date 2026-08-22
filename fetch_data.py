@@ -484,6 +484,51 @@ def extract_metrics(ticker, index_name, info):
     fcf = info.get("freeCashflow")
     p_fcf = (mcap / fcf) if (mcap and fcf and fcf > 0) else None
 
+    rev_growth = info.get("revenueGrowth")
+    eps_growth = info.get("earningsGrowth")
+
+    # PEG: si Yahoo no lo da (~42% de los casos), lo calculamos con PE / crecimiento EPS,
+    # que es la propia definición de PEG. Solo si el crecimiento es positivo (si no, PEG no
+    # tiene lectura útil).
+    peg = info.get("pegRatio")
+    if peg is None:
+        pe_for_peg = info.get("forwardPE") or info.get("trailingPE")
+        if pe_for_peg and eps_growth and eps_growth > 0:
+            peg = pe_for_peg / (eps_growth * 100)
+
+    # ROIC aproximado: el campo que se usaba antes ("returnOnCapitalEmployed") no existe en
+    # yfinance y siempre devolvía None. Esta es una aproximación con datos que SÍ vienen en
+    # .info (sin llamadas de red extra): EBIT ~ margen operativo x ingresos, Equity ~ book
+    # value x acciones. Es una estimación para poder ordenar/filtrar el universo completo —
+    # el ROIC preciso (con EBIT y patrimonio neto reales del balance) se calcula solo para
+    # las empresas seleccionadas, en el Análisis Profundo de app.py.
+    roic_approx = None
+    op_margin = info.get("operatingMargins")
+    revenue = info.get("totalRevenue")
+    book_value = info.get("bookValue")
+    shares_out_bs = info.get("sharesOutstanding")
+    total_debt_bs = info.get("totalDebt") or 0
+    total_cash_bs = info.get("totalCash") or 0
+    if op_margin is not None and revenue and book_value and shares_out_bs:
+        ebit_approx = op_margin * revenue
+        equity_approx = book_value * shares_out_bs
+        invested_capital_approx = total_debt_bs + equity_approx - total_cash_bs
+        if invested_capital_approx > 0:
+            nopat_approx = ebit_approx * (1 - 0.21)  # tasa fija de aproximación
+            roic_approx = (nopat_approx / invested_capital_approx) * 100
+            if roic_approx < -100 or roic_approx > 200:  # ruido numérico, no un ROIC real
+                roic_approx = None
+
+    # Debt/Equity: yfinance lo da en escala porcentual (ej. 59.4 = 59.4%), pero el resto de la
+    # app (presets, filtros) asume escala ratio (0.5 = 50%). Se convierte ÷100 y se recortan
+    # valores fuera de un rango razonable (probable artefacto numérico por equity ~0).
+    de_raw = info.get("debtToEquity")
+    debt_equity = None
+    if de_raw is not None:
+        de_ratio = de_raw / 100
+        if 0 <= de_ratio <= 50:
+            debt_equity = de_ratio
+
     return {
         "Ticker": ticker,
         "Nombre": info.get("shortName") or info.get("longName") or ticker,
@@ -492,23 +537,25 @@ def extract_metrics(ticker, index_name, info):
         "Market Cap (B)": mcap_b,
         "PER (Trailing)": info.get("trailingPE"),
         "PER (Forward)": info.get("forwardPE"),
-        "PEG": info.get("pegRatio"),
+        "PEG": peg,
         "EV/EBITDA": info.get("enterpriseToEbitda"),
         "EV/Sales": info.get("enterpriseToRevenue"),
         "P/S": info.get("priceToSalesTrailing12Months"),
         "P/B": info.get("priceToBook"),
         "P/FCF": p_fcf, # ¡Columna arreglada!
-        "Crec. Ventas YoY (%)": (info.get("revenueGrowth") * 100) if info.get("revenueGrowth") is not None else None,
-        "Crec. Ventas 3Y (%)": None, # Requiere histórico profundo
-        "Crec. EPS YoY (%)": (info.get("earningsGrowth") * 100) if info.get("earningsGrowth") is not None else None,
-        "Crec. EPS 3Y (%)": None, # Requiere histórico profundo
-        "ROIC (%)": info.get("returnOnCapitalEmployed") * 100 if info.get("returnOnCapitalEmployed") is not None else None, # A veces yfinance lo da como ROCE
+        "Crec. Ventas YoY (%)": (rev_growth * 100) if rev_growth is not None else None,
+        "Crec. EPS YoY (%)": (eps_growth * 100) if eps_growth is not None else None,
+        # Crec. Ventas/EPS a 3 años: se ha quitado de aquí (siempre daba None — nunca se llegó a
+        # calcular). El CAGR real a 3-4 años se calcula ahora en el Análisis Profundo de app.py,
+        # reutilizando el income_stmt que ya se descarga ahí para el ROIC y el PER histórico
+        # (coste de red ≈ 0 extra), en vez de duplicar aquí ~2.500 llamadas más.
+        "ROIC Aprox. (%)": roic_approx,  # ROIC exacto: solo en el Análisis Profundo (app.py)
         "ROE (%)": (info.get("returnOnEquity") * 100) if info.get("returnOnEquity") is not None else None,
         "ROA (%)": (info.get("returnOnAssets") * 100) if info.get("returnOnAssets") is not None else None,
         "Margen Bruto (%)": (info.get("grossMargins") * 100) if info.get("grossMargins") is not None else None,
         "Margen Operativo (%)": (info.get("operatingMargins") * 100) if info.get("operatingMargins") is not None else None,
         "Margen Neto (%)": (info.get("profitMargins") * 100) if info.get("profitMargins") is not None else None,
-        "Debt/Equity": info.get("debtToEquity"),
+        "Debt/Equity": debt_equity,
         "Current Ratio": info.get("currentRatio"),
         "Payout Ratio (%)": (info.get("payoutRatio") * 100) if info.get("payoutRatio") is not None else None,
     }
